@@ -55,6 +55,8 @@ HISTORY_COLUMNS = [
     "open",
     "high",
     "low",
+    "ceiling_price",
+    "floor_price",
     "close",
     "volume",
 ]
@@ -77,12 +79,16 @@ REALTIME_COLUMNS = [
 
 FOREIGN_FLOW_COLUMNS = [
     "symbol",
+    "trading_date",
     "timestamp",
     "foreign_buy_volume",
     "foreign_sell_volume",
     "foreign_net_volume",
     "foreign_net_buy_volume",
     "foreign_net_sell_volume",
+    "foreign_buy_value",
+    "foreign_sell_value",
+    "foreign_net_value",
     "source",
     "collected_at",
 ]
@@ -114,7 +120,7 @@ FUNDAMENTAL_NUMERIC_COLUMNS = [
 
 CORE_FUNDAMENTAL_COLUMNS = ["pe", "pb", "roe", "roa", "debt_to_equity"]
 SOURCE_COMPARISON_COLUMNS = ["pe", "pb", "roe", "roa", "debt_to_equity", "eps", "market_cap"]
-SOURCE_PRIORITY = {"VCI": 0, "KBS": 1}
+SOURCE_PRIORITY = {"VNFINANCIALDATA": 0, "KBS": 1, "VCI": 2}
 
 
 @dataclass(frozen=True)
@@ -195,6 +201,9 @@ class AnalyticsPipeline:
             )
 
         history_files = sorted((self.config.input_dir / "history").glob("*.csv"))
+        market_history_files = sorted(
+            (self.config.input_dir / "market" / "history").glob("*.csv")
+        )
         realtime_files = sorted((self.config.input_dir / "realtime").glob("*.jsonl"))
         foreign_files = sorted((self.config.input_dir / "foreign").glob("*.csv"))
         screening_files = sorted((self.config.input_dir / "fundamental").glob("screening_*.csv"))
@@ -205,6 +214,7 @@ class AnalyticsPipeline:
         )
 
         self.raw["history"] = self._read_history_files(history_files)
+        self.raw["market_history"] = self._read_history_files(market_history_files)
         self.raw["realtime"] = self._read_jsonl_files(realtime_files)
         self.raw["foreign_flow"] = self._read_csv_files(
             foreign_files, include_source_file=True
@@ -332,8 +342,9 @@ class AnalyticsPipeline:
 
         duplicate_keys = {
             "history": ["symbol", "t"],
+            "market_history": ["symbol", "t"],
             "realtime": ["symbol", "time", "matchPrice", "matchQtty", "side"],
-            "foreign_flow": ["symbol", "collected_at", "source"],
+            "foreign_flow": ["symbol", "trading_date", "source"],
             "screening": ["symbol", "period_type", "period", "source"],
             "fundamentals": ["symbol", "period_type", "period", "source"],
         }
@@ -362,7 +373,10 @@ class AnalyticsPipeline:
     def clean(self) -> None:
         """Xóa trùng, chuẩn hóa kiểu cơ bản và tách các dòng không hợp lệ."""
 
-        self.cleaned["history"] = self._clean_history(self.raw["history"])
+        self.cleaned["history"] = self._clean_history(self.raw["history"], "history")
+        self.cleaned["market_history"] = self._clean_history(
+            self.raw["market_history"], "market_history"
+        )
         self.cleaned["realtime"] = self._clean_realtime(self.raw["realtime"])
         self.cleaned["foreign_flow"] = self._clean_foreign_flow(
             self.raw["foreign_flow"]
@@ -372,9 +386,9 @@ class AnalyticsPipeline:
             self.raw["fundamentals"], "fundamentals"
         )
 
-    def _clean_history(self, frame: pd.DataFrame) -> pd.DataFrame:
+    def _clean_history(self, frame: pd.DataFrame, dataset: str) -> pd.DataFrame:
         if frame.empty:
-            self.rejected["history"] = pd.DataFrame()
+            self.rejected[dataset] = pd.DataFrame()
             return pd.DataFrame(columns=HISTORY_COLUMNS)
 
         data = frame.copy()
@@ -409,12 +423,12 @@ class AnalyticsPipeline:
         )
         rejected = data.loc[invalid].copy()
         rejected["reject_reason"] = "OHLCV hoặc thời gian/mã cổ phiếu không hợp lệ"
-        self.rejected["history"] = rejected
+        self.rejected[dataset] = rejected
 
         valid = data.loc[~invalid].copy()
         before = len(valid)
         valid = valid.drop_duplicates(["symbol", "interval", "timestamp_utc"], keep="last")
-        self.stats["history"]["duplicate_rows_removed"] = before - len(valid)
+        self.stats[dataset]["duplicate_rows_removed"] = before - len(valid)
         return valid
 
     def _clean_realtime(self, frame: pd.DataFrame) -> pd.DataFrame:
@@ -506,12 +520,25 @@ class AnalyticsPipeline:
             "foreign_net_volume",
             "foreign_net_buy_volume",
             "foreign_net_sell_volume",
+            "foreign_buy_value",
+            "foreign_sell_value",
+            "foreign_net_value",
         ]:
             values = data[column] if column in data.columns else pd.Series(np.nan, index=data.index)
             data[column] = pd.to_numeric(values, errors="coerce")
         data["collected_at"] = pd.to_datetime(
             data.get("collected_at"), utc=True, errors="coerce"
         )
+        raw_timestamp = data.get("timestamp", pd.Series(pd.NaT, index=data.index))
+        parsed_timestamp = pd.to_datetime(raw_timestamp, utc=True, errors="coerce")
+        raw_trading_date = data.get(
+            "trading_date", pd.Series(pd.NA, index=data.index, dtype="string")
+        )
+        parsed_trading_date = pd.to_datetime(raw_trading_date, errors="coerce")
+        fallback_date = parsed_timestamp.dt.tz_convert(LOCAL_TIMEZONE).dt.tz_localize(None)
+        collected_date = data["collected_at"].dt.tz_convert(LOCAL_TIMEZONE).dt.tz_localize(None)
+        parsed_trading_date = parsed_trading_date.fillna(fallback_date).fillna(collected_date)
+        data["trading_date"] = parsed_trading_date.dt.date.astype("string")
         expected_net = data["foreign_buy_volume"] - data["foreign_sell_volume"]
         net_mismatch = (
                 data["foreign_net_volume"].notna()
@@ -521,6 +548,7 @@ class AnalyticsPipeline:
         )
         invalid = (
                 data["symbol"].isna()
+                | parsed_trading_date.isna()
                 | data["collected_at"].isna()
                 | data["foreign_buy_volume"].isna()
                 | data["foreign_sell_volume"].isna()
@@ -538,10 +566,15 @@ class AnalyticsPipeline:
         valid["foreign_net_sell_volume"] = (-valid["foreign_net_volume"]).clip(lower=0)
         if "timestamp" not in valid.columns:
             valid["timestamp"] = pd.NaT
+        valid["timestamp"] = parsed_timestamp.loc[valid.index]
         before = len(valid)
-        valid = valid.drop_duplicates(["symbol", "collected_at", "source"], keep="last")
+        valid = valid.sort_values(["collected_at"]).drop_duplicates(
+            ["symbol", "trading_date", "source"], keep="last"
+        )
         self.stats["foreign_flow"]["duplicate_rows_removed"] = before - len(valid)
-        return valid[FOREIGN_FLOW_COLUMNS].sort_values(["symbol", "collected_at"])
+        return valid[FOREIGN_FLOW_COLUMNS].sort_values(
+            ["symbol", "trading_date", "source"]
+        )
 
     def _clean_fundamentals(self, frame: pd.DataFrame, name: str) -> pd.DataFrame:
         if frame.empty:
@@ -569,10 +602,34 @@ class AnalyticsPipeline:
             .str.strip()
             .str.upper()
         )
+        raw_published_date = (
+            data.get(
+                "published_date",
+                pd.Series(pd.NA, index=data.index, dtype="string"),
+            )
+            .astype("string")
+            .str.strip()
+        )
+        missing_published_date = raw_published_date.isna() | raw_published_date.eq("")
+        estimated_published_date = data["period"].map(
+            self._estimated_published_date
+        )
+        data["published_date"] = raw_published_date.mask(
+            missing_published_date,
+            estimated_published_date,
+        )
 
         for column in FUNDAMENTAL_NUMERIC_COLUMNS:
             if column in data.columns:
                 data[column] = pd.to_numeric(data[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+        # Nguồn có thể trả 0 cho chỉ tiêu thanh khoản không áp dụng (thường gặp ở ngân hàng).
+        # Xem đây là thiếu một phần thay vì loại cả dòng BCTC và làm mất chỉ tiêu hợp lệ.
+        for optional_ratio in ["current_ratio", "quick_ratio"]:
+            if optional_ratio in data.columns:
+                data[optional_ratio] = data[optional_ratio].mask(
+                    data[optional_ratio].eq(0)
+                )
 
         quarter_ok = data["period"].str.fullmatch(r"\d{4}-Q[1-4]", na=False)
         year_ok = data["period"].str.fullmatch(r"\d{4}", na=False)
@@ -627,6 +684,9 @@ class AnalyticsPipeline:
         """Đưa dữ liệu sạch về tên cột và kiểu dữ liệu thống nhất."""
 
         self.cleaned["history"] = self._normalize_history(self.cleaned["history"])
+        self.cleaned["market_history"] = self._normalize_history(
+            self.cleaned["market_history"]
+        )
         self.cleaned["realtime"] = self._normalize_realtime(self.cleaned["realtime"])
         self.cleaned["screening"] = self._normalize_fundamental_frame(self.cleaned["screening"])
         self.cleaned["fundamentals"] = self._normalize_fundamental_frame(
@@ -645,7 +705,7 @@ class AnalyticsPipeline:
         result["timestamp_local"] = result["timestamp_utc"].dt.tz_convert(LOCAL_TIMEZONE)
         result["date"] = result["timestamp_local"].dt.date.astype("string")
         result["volume"] = result["volume"].round().astype("Int64")
-        return result[HISTORY_COLUMNS].sort_values(["symbol", "interval", "timestamp_utc"])
+        return result.reindex(columns=HISTORY_COLUMNS).sort_values(["symbol", "interval", "timestamp_utc"])
 
     @staticmethod
     def _normalize_realtime(data: pd.DataFrame) -> pd.DataFrame:
@@ -668,6 +728,12 @@ class AnalyticsPipeline:
         result["open"] = data["openPrice"]
         result["high"] = data["highestPrice"]
         result["low"] = data["lowestPrice"]
+        result["ceiling_price"] = pd.to_numeric(
+            data.get("ceilingPrice", data.get("ceiling_price")), errors="coerce"
+        )
+        result["floor_price"] = pd.to_numeric(
+            data.get("floorPrice", data.get("floor_price")), errors="coerce"
+        )
         return result[REALTIME_COLUMNS].sort_values(["symbol", "timestamp_local"])
 
     @staticmethod
@@ -735,11 +801,10 @@ class AnalyticsPipeline:
         selected_rows: list[dict[str, Any]] = []
         audit_rows: list[dict[str, Any]] = []
 
-        for (symbol, period_type), symbol_rows in data.groupby(
-                ["symbol", "period_type"], sort=True
+        for (symbol, period_type, period), candidates in data.groupby(
+                ["symbol", "period_type", "period"], sort=True
         ):
-            latest_period = symbol_rows["period"].max()
-            candidates = symbol_rows[symbol_rows["period"] == latest_period].copy()
+            candidates = candidates.copy()
             candidates["_source_priority"] = candidates["source"].map(SOURCE_PRIORITY).fillna(99)
             available_core = [column for column in CORE_FUNDAMENTAL_COLUMNS if column in candidates]
             if available_core:
@@ -795,7 +860,7 @@ class AnalyticsPipeline:
                 {
                     "symbol": symbol,
                     "period_type": period_type,
-                    "period": latest_period,
+                    "period": period,
                     "selected_source": selected_source,
                     "available_sources": ",".join(candidates["source"].astype(str).drop_duplicates()),
                     "selected_core_coverage": float(
@@ -839,9 +904,19 @@ class AnalyticsPipeline:
         issues: list[dict[str, str]] = []
         required = {
             "history": {"symbol", "timestamp_utc", "open", "high", "low", "close", "volume"},
+            "market_history": {
+                "symbol",
+                "timestamp_utc",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+            },
             "realtime": {"symbol", "timestamp_local", "match_price", "match_quantity"},
             "foreign_flow": {
                 "symbol",
+                "trading_date",
                 "foreign_buy_volume",
                 "foreign_sell_volume",
                 "foreign_net_volume",
@@ -883,6 +958,11 @@ class AnalyticsPipeline:
         history = self.cleaned["history"]
         if not history.empty:
             datasets["history"]["latest_timestamp_utc"] = self._iso_value(history["timestamp_utc"].max())
+        market_history = self.cleaned["market_history"]
+        if not market_history.empty:
+            datasets["market_history"]["latest_timestamp_utc"] = self._iso_value(
+                market_history["timestamp_utc"].max()
+            )
         realtime = self.cleaned["realtime"]
         if not realtime.empty:
             datasets["realtime"]["latest_crawled_at_utc"] = self._iso_value(
@@ -965,15 +1045,20 @@ class AnalyticsPipeline:
     def _build_symbol_quality(self) -> pd.DataFrame:
         """Kiểm tra độ tin cậy theo từng mã và quyết định có được phát tín hiệu hay không."""
 
-        symbols = set(self.config.expected_symbols)
-        for frame in [
-            self.cleaned["history"],
-            self.cleaned["realtime"],
-            self.cleaned["foreign_flow"],
-            self.reconciled_fundamentals,
-        ]:
-            if "symbol" in frame.columns:
-                symbols.update(frame["symbol"].dropna().astype(str))
+        symbols = {
+            str(symbol).strip().upper()
+            for symbol in self.config.expected_symbols
+            if str(symbol).strip()
+        }
+        if not symbols:
+            for frame in [
+                self.cleaned["history"],
+                self.cleaned["realtime"],
+                self.cleaned["foreign_flow"],
+                self.reconciled_fundamentals,
+            ]:
+                if "symbol" in frame.columns:
+                    symbols.update(frame["symbol"].dropna().astype(str))
         columns = [
             "symbol",
             "data_status",
@@ -981,6 +1066,12 @@ class AnalyticsPipeline:
             "history_rows",
             "price_age_days",
             "realtime_age_minutes",
+            "realtime_collection_age_minutes",
+            "foreign_sessions_available",
+            "foreign_source",
+            "market_context_symbol",
+            "market_price_age_days",
+            "roe_ttm_available",
             "fundamental_period",
             "fundamental_age_days",
             "fundamental_coverage",
@@ -995,10 +1086,45 @@ class AnalyticsPipeline:
             return pd.DataFrame(columns=columns)
 
         now = pd.Timestamp.now(tz="UTC")
+        roe_ttm_frame = self._calculate_roe_ttm()
+        roe_ttm_by_symbol = (
+            roe_ttm_frame.set_index("symbol")["roe_ttm"]
+            if not roe_ttm_frame.empty
+            else pd.Series(dtype="float64")
+        )
+        market_history = self.cleaned["market_history"]
+        market_context_symbol: str | None = None
+        market_price_age_days = np.nan
+        market_blocking: list[str] = []
+        market_warnings: list[str] = []
+        if market_history.empty:
+            market_warnings.append("Thiếu lịch sử VNINDEX/VN30")
+        else:
+            market_symbols = set(market_history["symbol"].dropna().astype(str))
+            market_context_symbol = (
+                "VNINDEX"
+                if "VNINDEX" in market_symbols
+                else ("VN30" if "VN30" in market_symbols else sorted(market_symbols)[0])
+            )
+            selected_market = market_history[
+                market_history["symbol"] == market_context_symbol
+                ]
+            market_price_age_days = float(
+                (now - selected_market["timestamp_utc"].max()) / pd.Timedelta(days=1)
+            )
+            if len(selected_market) < 20:
+                market_warnings.append(
+                    f"{market_context_symbol} chỉ có {len(selected_market)}/20 phiên để tính SMA20"
+                )
+            if market_price_age_days > self.config.max_price_age_days:
+                market_warnings.append(
+                    f"Dữ liệu {market_context_symbol} quá cũ ({market_price_age_days:.1f} ngày)"
+                )
+
         rows: list[dict[str, Any]] = []
         for symbol in sorted(symbols):
-            blocking: list[str] = []
-            warnings: list[str] = []
+            blocking: list[str] = list(market_blocking)
+            warnings: list[str] = list(market_warnings)
 
             history = self.cleaned["history"]
             symbol_history = history[history["symbol"] == symbol] if not history.empty else history
@@ -1021,17 +1147,49 @@ class AnalyticsPipeline:
             realtime = self.cleaned["realtime"]
             symbol_realtime = realtime[realtime["symbol"] == symbol] if not realtime.empty else realtime
             realtime_age_minutes = np.nan
+            realtime_collection_age_minutes = np.nan
             if symbol_realtime.empty:
                 message = "Thiếu realtime/API realtime không trả dữ liệu"
                 (blocking if self.config.require_realtime_for_signal else warnings).append(message)
             else:
-                latest_realtime = symbol_realtime["crawled_at_utc"].max()
-                realtime_age_minutes = float((now - latest_realtime) / pd.Timedelta(minutes=1))
+                latest_event = symbol_realtime["timestamp_local"].max()
+                latest_collection = symbol_realtime["crawled_at_utc"].max()
+                realtime_age_minutes = float(
+                    (now - latest_event.tz_convert("UTC")) / pd.Timedelta(minutes=1)
+                )
+                realtime_collection_age_minutes = float(
+                    (now - latest_collection) / pd.Timedelta(minutes=1)
+                )
                 if realtime_age_minutes < -5:
                     blocking.append("Thời gian realtime nằm trong tương lai")
                 elif realtime_age_minutes > self.config.max_realtime_age_minutes:
-                    message = f"Realtime quá cũ ({realtime_age_minutes:.0f} phút)"
-                    (blocking if self.config.require_realtime_for_signal else warnings).append(message)
+                    local_time = now.tz_convert("Asia/Ho_Chi_Minh")
+                    is_market_closed = local_time.hour >= 15 or local_time.hour < 9 or local_time.weekday() >= 5
+                    if not is_market_closed:
+                        message = f"Realtime quá cũ ({realtime_age_minutes:.0f} phút)"
+                        (blocking if self.config.require_realtime_for_signal else warnings).append(message)
+
+                if realtime_collection_age_minutes > self.config.max_realtime_age_minutes:
+                    local_time = now.tz_convert("Asia/Ho_Chi_Minh")
+                    is_market_closed = local_time.hour >= 15 or local_time.hour < 9 or local_time.weekday() >= 5
+                    if not is_market_closed:
+                        message = (
+                            "Crawler realtime không cập nhật "
+                            f"({realtime_collection_age_minutes:.0f} phút)"
+                        )
+                        (blocking if self.config.require_realtime_for_signal else warnings).append(message)
+
+            foreign = self._preferred_foreign_rows(
+                self.cleaned["foreign_flow"], symbol
+            )
+            foreign_sessions_available = int(foreign["trading_date"].nunique())
+            foreign_source = (
+                str(foreign["source"].iloc[0]) if not foreign.empty else None
+            )
+            if foreign_sessions_available < 5:
+                warnings.append(
+                    f"Thiếu chuỗi khối ngoại: có {foreign_sessions_available}/5 phiên"
+                )
 
             fundamental = self.reconciled_fundamentals
             symbol_fundamental = (
@@ -1045,8 +1203,12 @@ class AnalyticsPipeline:
             selected_source: str | None = None
             fallback_sources = ""
             source_consistent = True
+            roe_ttm = pd.to_numeric(
+                roe_ttm_by_symbol.get(symbol, np.nan), errors="coerce"
+            )
+            roe_ttm_available = bool(pd.notna(roe_ttm))
             if symbol_fundamental.empty:
-                blocking.append("Thiếu báo cáo tài chính/API cơ bản không trả dữ liệu")
+                warnings.append("Thiếu báo cáo tài chính/API cơ bản không trả dữ liệu")
             else:
                 quarter = symbol_fundamental[symbol_fundamental["period_type"] == "quarter"]
                 selected = quarter.iloc[-1] if not quarter.empty else symbol_fundamental.iloc[-1]
@@ -1069,30 +1231,33 @@ class AnalyticsPipeline:
                     float(selected[available_core].notna().mean()) if available_core else 0.0
                 )
                 if coverage < self.config.minimum_fundamental_coverage:
-                    blocking.append(f"Chỉ tiêu cơ bản chỉ đủ {coverage:.0%}")
+                    warnings.append(f"Chỉ tiêu cơ bản chỉ đủ {coverage:.0%}")
                 if not source_consistent:
-                    blocking.append(
+                    warnings.append(
                         f"Nguồn tài chính mâu thuẫn: {selected.get('source_conflicts', '')}"
                     )
 
+                if not published_date and fundamental_period:
+                    p_end = self._period_end(str(fundamental_period))
+                    if p_end is not None:
+                        published_date = (p_end + pd.Timedelta(days=35)).strftime("%Y-%m-%d")
+                        warnings.append("Ước lượng ngày công bố BCTC theo kỳ báo cáo")
                 if not published_date:
-                    blocking.append(
-                        "Thiếu ngày công bố BCTC; không thể kiểm soát dữ liệu nhìn trước"
-                    )
+                    warnings.append("Thiếu ngày công bố BCTC")
                 else:
                     parsed_published = pd.to_datetime(
                         published_date, utc=True, errors="coerce"
                     )
                     if pd.isna(parsed_published):
-                        blocking.append("Ngày công bố BCTC sai định dạng")
+                        warnings.append("Ngày công bố BCTC sai định dạng")
                     elif parsed_published > now:
-                        blocking.append("Ngày công bố BCTC nằm trong tương lai")
+                        warnings.append("Ngày công bố BCTC nằm trong tương lai")
                 if not financial_collected_at:
-                    blocking.append("Thiếu thời điểm thu thập báo cáo tài chính")
+                    warnings.append("Thiếu thời điểm thu thập báo cáo tài chính")
 
                 period_end = self._period_end(str(fundamental_period))
                 if period_end is None:
-                    blocking.append("Không xác định được ngày kết thúc kỳ tài chính")
+                    warnings.append("Không xác định được ngày kết thúc kỳ tài chính")
                 else:
                     fundamental_age_days = float((now.normalize() - period_end).days)
                     maximum_age = (
@@ -1101,9 +1266,13 @@ class AnalyticsPipeline:
                         else self.config.max_year_age_days
                     )
                     if fundamental_age_days > maximum_age:
-                        blocking.append(
+                        warnings.append(
                             f"Báo cáo tài chính quá cũ ({fundamental_age_days:.0f} ngày)"
                         )
+                if not roe_ttm_available:
+                    warnings.append(
+                        "Chưa tính được ROE TTM từ 4 quý liên tiếp (dùng ROE quý/năm thay thế)"
+                    )
 
             reasons = blocking + warnings
             rows.append(
@@ -1114,6 +1283,12 @@ class AnalyticsPipeline:
                     "history_rows": history_rows,
                     "price_age_days": price_age_days,
                     "realtime_age_minutes": realtime_age_minutes,
+                    "realtime_collection_age_minutes": realtime_collection_age_minutes,
+                    "foreign_sessions_available": foreign_sessions_available,
+                    "foreign_source": foreign_source,
+                    "market_context_symbol": market_context_symbol,
+                    "market_price_age_days": market_price_age_days,
+                    "roe_ttm_available": roe_ttm_available,
                     "fundamental_period": fundamental_period,
                     "fundamental_age_days": fundamental_age_days,
                     "fundamental_coverage": coverage,
@@ -1141,6 +1316,15 @@ class AnalyticsPipeline:
         return None
 
     @staticmethod
+    def _estimated_published_date(period: Any) -> str | None:
+        """Ước lượng ngày công bố bằng ngày kết thúc kỳ cộng 30 ngày."""
+
+        period_end = AnalyticsPipeline._period_end(str(period))
+        if period_end is None:
+            return None
+        return (period_end + pd.Timedelta(days=30)).isoformat()
+
+    @staticmethod
     def _iso_value(value: Any) -> str | None:
         if pd.isna(value):
             return None
@@ -1151,6 +1335,10 @@ class AnalyticsPipeline:
         """Tính chỉ báo giá, ghép dữ liệu cơ bản và chấm điểm sàng lọc."""
 
         price = self._analyze_price_history(self.cleaned["history"])
+        market_metrics = self._analyze_price_history(self.cleaned["market_history"])
+        market_context = market_metrics.rename(
+            columns={"price_as_of": "as_of", "latest_close": "close"}
+        )
         latest_fundamental = self._latest_fundamentals()
         snapshot = self._merge_snapshot(
             price,
@@ -1163,6 +1351,7 @@ class AnalyticsPipeline:
             snapshot = snapshot.merge(data_quality, on="symbol", how="outer", validate="one_to_one")
         ranked = self._rank_stocks(snapshot)
         self.analysis["price_metrics"] = price
+        self.analysis["market_context"] = market_context
         self.analysis["stock_snapshot"] = snapshot
         self.analysis["screening_ranked"] = ranked
 
@@ -1172,6 +1361,8 @@ class AnalyticsPipeline:
             "symbol",
             "price_as_of",
             "latest_close",
+            "previous_close",
+            "latest_volume",
             "return_1d",
             "return_5d",
             "return_20d",
@@ -1201,6 +1392,8 @@ class AnalyticsPipeline:
             "volume_ratio_20d",
             "distance_from_52w_high",
             "trend_state",
+            "ob_support",
+            "ob_resistance",
             "indicator_data_complete",
         ]
         if history.empty:
@@ -1309,11 +1502,22 @@ class AnalyticsPipeline:
             else:
                 trend_state = "NEUTRAL"
 
+            open_p = (
+                group["open"].astype(float)
+                if "open" in group.columns
+                else (group["o"].astype(float) if "o" in group.columns else close)
+            )
+            ob_support, ob_resistance = AnalyticsPipeline._detect_order_blocks(
+                high=high, low=low, close=close, open_p=open_p
+            )
+
             records.append(
                 {
                     "symbol": symbol,
                     "price_as_of": latest["date"],
                     "latest_close": latest_close,
+                    "previous_close": float(close.iloc[-2]) if len(close) > 1 else np.nan,
+                    "latest_volume": float(volume.iloc[-1]),
                     "return_1d": AnalyticsPipeline._period_return(close, 1),
                     "return_5d": AnalyticsPipeline._period_return(close, 5),
                     "return_20d": AnalyticsPipeline._period_return(close, 20),
@@ -1347,16 +1551,253 @@ class AnalyticsPipeline:
                     if not np.isnan(float(high_52w)) and float(high_52w) > 0
                     else np.nan,
                     "trend_state": trend_state,
+                    "ob_support": ob_support,
+                    "ob_resistance": ob_resistance,
                     "indicator_data_complete": indicator_data_complete,
                 }
             )
         return pd.DataFrame(records, columns=columns)
 
     @staticmethod
+    def _detect_order_blocks(
+            high: pd.Series,
+            low: pd.Series,
+            close: pd.Series,
+            open_p: pd.Series,
+            window: int = 60,
+    ) -> tuple[float | None, float | None]:
+        """Xác định ngưỡng hỗ trợ Bullish Order Block (ob_support) và kháng cự Bearish Order Block (ob_resistance).
+
+        - ob_support: Đáy cây nến giảm cuối cùng trước nhịp tăng tạo Swing High (hoặc Swing Low hỗ trợ gần nhất).
+        - ob_resistance: Đỉnh cây nến tăng cuối cùng trước nhịp giảm tạo Swing Low (hoặc Swing High kháng cự gần nhất).
+        """
+        n = len(close)
+        if n < 20:
+            return None, None
+
+        h = high.to_numpy(dtype=float)
+        lo = low.to_numpy(dtype=float)
+        c = close.to_numpy(dtype=float)
+        o = (
+            open_p.to_numpy(dtype=float)
+            if open_p is not None and len(open_p) == n
+            else c
+        )
+        latest_c = float(c[-1])
+
+        start_idx = max(0, n - window)
+        h_w = h[start_idx:]
+        lo_w = lo[start_idx:]
+        c_w = c[start_idx:]
+        o_w = o[start_idx:]
+        num_w = len(c_w)
+
+        swing_highs: list[tuple[int, float]] = []
+        swing_lows: list[tuple[int, float]] = []
+        for i in range(2, num_w - 2):
+            if (
+                    h_w[i] >= h_w[i - 1]
+                    and h_w[i] >= h_w[i - 2]
+                    and h_w[i] >= h_w[i + 1]
+                    and h_w[i] >= h_w[i + 2]
+            ):
+                swing_highs.append((i, float(h_w[i])))
+            if (
+                    lo_w[i] <= lo_w[i - 1]
+                    and lo_w[i] <= lo_w[i - 2]
+                    and lo_w[i] <= lo_w[i + 1]
+                    and lo_w[i] <= lo_w[i + 2]
+            ):
+                swing_lows.append((i, float(lo_w[i])))
+
+        bullish_ob_low: float | None = None
+        for sh_idx, _ in reversed(swing_highs):
+            for j in range(sh_idx - 1, max(0, sh_idx - 6), -1):
+                if c_w[j] < o_w[j]:
+                    cand_low = float(lo_w[j])
+                    if cand_low < latest_c:
+                        bullish_ob_low = cand_low
+                        break
+            if bullish_ob_low is not None:
+                break
+
+        ob_support = bullish_ob_low
+        if ob_support is None:
+            valid_lows = [sl_val for _, sl_val in swing_lows if sl_val < latest_c * 0.995]
+            if valid_lows:
+                ob_support = max(valid_lows)
+
+        bearish_ob_high: float | None = None
+        for sl_idx, _ in reversed(swing_lows):
+            for j in range(sl_idx - 1, max(0, sl_idx - 6), -1):
+                if c_w[j] > o_w[j]:
+                    cand_high = float(h_w[j])
+                    if cand_high > latest_c:
+                        bearish_ob_high = cand_high
+                        break
+            if bearish_ob_high is not None:
+                break
+
+        ob_resistance = bearish_ob_high
+        if ob_resistance is None:
+            valid_highs = [sh_val for _, sh_val in swing_highs if sh_val > latest_c * 1.005]
+            if valid_highs:
+                ob_resistance = min(valid_highs)
+
+        res_support = (
+            ob_support
+            if (ob_support is not None and 0 < ob_support < latest_c)
+            else None
+        )
+        res_resistance = (
+            ob_resistance
+            if (ob_resistance is not None and ob_resistance > latest_c)
+            else None
+        )
+        return res_support, res_resistance
+
+    @staticmethod
     def _period_return(close: pd.Series, periods: int) -> float:
         if len(close) <= periods or close.iloc[-periods - 1] <= 0:
             return np.nan
         return float(close.iloc[-1] / close.iloc[-periods - 1] - 1)
+
+    def _calculate_roe_ttm(self) -> pd.DataFrame:
+        """Tính ROE TTM từ đúng bốn quý và vốn chủ bình quân đầu/cuối kỳ."""
+
+        columns = [
+            "symbol",
+            "roe_ttm",
+            "net_profit_ttm",
+            "average_equity_ttm",
+            "roe_ttm_start_period",
+            "roe_ttm_end_period",
+            "roe_ttm_method",
+        ]
+        source = self.reconciled_fundamentals
+        if source.empty:
+            return pd.DataFrame(columns=columns)
+        quarter = source[source["period_type"] == "quarter"].copy()
+        required = {"symbol", "period", "net_profit", "owners_equity"}
+        if quarter.empty or not required.issubset(quarter.columns):
+            return pd.DataFrame(columns=columns)
+
+        parsed = quarter["period"].astype("string").str.extract(
+            r"^(?P<year>\d{4})-Q(?P<quarter>[1-4])$"
+        )
+        quarter["_year"] = pd.to_numeric(parsed["year"], errors="coerce")
+        quarter["_quarter"] = pd.to_numeric(parsed["quarter"], errors="coerce")
+        quarter["_ordinal"] = quarter["_year"] * 4 + quarter["_quarter"] - 1
+        quarter["net_profit"] = pd.to_numeric(quarter["net_profit"], errors="coerce")
+        quarter["owners_equity"] = pd.to_numeric(
+            quarter["owners_equity"], errors="coerce"
+        )
+        quarter = quarter.dropna(subset=["_ordinal"]).drop_duplicates(
+            ["symbol", "_ordinal"], keep="last"
+        )
+
+        records: list[dict[str, Any]] = []
+        for symbol, group in quarter.groupby("symbol", sort=True):
+            group = group.sort_values("_ordinal").set_index("_ordinal", drop=False)
+            latest_ordinal = int(group["_ordinal"].max())
+            ttm_ordinals = list(range(latest_ordinal - 3, latest_ordinal + 1))
+            beginning_ordinal = latest_ordinal - 4
+            if not all(ordinal in group.index for ordinal in ttm_ordinals):
+                continue
+            ttm_rows = group.loc[ttm_ordinals]
+            net_profit = ttm_rows["net_profit"]
+            if beginning_ordinal in group.index and pd.notna(
+                    group.at[beginning_ordinal, "owners_equity"]
+            ):
+                beginning_equity = group.at[beginning_ordinal, "owners_equity"]
+                method = "SUM_4Q_NET_PROFIT/AVG_BEGIN_END_EQUITY"
+            else:
+                beginning_equity = ttm_rows.iloc[0]["owners_equity"]
+                method = "SUM_4Q_NET_PROFIT/AVG_FIRST_END_EQUITY_APPROX"
+            ending_equity = group.at[latest_ordinal, "owners_equity"]
+            if (
+                    net_profit.isna().any()
+                    or pd.isna(beginning_equity)
+                    or pd.isna(ending_equity)
+            ):
+                continue
+            average_equity = (float(beginning_equity) + float(ending_equity)) / 2
+            if average_equity <= 0:
+                continue
+            net_profit_ttm = float(net_profit.sum())
+            records.append(
+                {
+                    "symbol": str(symbol),
+                    "roe_ttm": net_profit_ttm / average_equity,
+                    "net_profit_ttm": net_profit_ttm,
+                    "average_equity_ttm": average_equity,
+                    "roe_ttm_start_period": str(ttm_rows.iloc[0]["period"]),
+                    "roe_ttm_end_period": str(ttm_rows.iloc[-1]["period"]),
+                    "roe_ttm_method": method,
+                }
+            )
+        return pd.DataFrame(records, columns=columns)
+
+    @staticmethod
+    def _preferred_foreign_rows(
+            foreign_flow: pd.DataFrame, symbol: str
+    ) -> pd.DataFrame:
+        """Chọn một nguồn khối ngoại có nhiều phiên nhất, ưu tiên DNSE khi hòa."""
+
+        if foreign_flow.empty:
+            return foreign_flow.copy()
+        selected = foreign_flow[foreign_flow["symbol"] == symbol].copy()
+        if selected.empty:
+            return selected
+        counts = (
+            selected.groupby("source")["trading_date"]
+            .nunique()
+            .rename("sessions")
+            .reset_index()
+        )
+        counts["priority"] = counts["source"].map({"DNSE": 0, "KBS": 1}).fillna(99)
+        source = counts.sort_values(
+            ["sessions", "priority"], ascending=[False, True]
+        ).iloc[0]["source"]
+        return selected[selected["source"] == source].sort_values("trading_date")
+
+    @classmethod
+    def _summarize_foreign_flow(cls, foreign_flow: pd.DataFrame) -> pd.DataFrame:
+        """Tổng hợp năm phiên gần nhất và giữ snapshot mới nhất của từng mã."""
+
+        if foreign_flow.empty:
+            return pd.DataFrame(columns=["symbol"])
+        records: list[dict[str, Any]] = []
+        for symbol in sorted(foreign_flow["symbol"].dropna().astype(str).unique()):
+            selected = cls._preferred_foreign_rows(foreign_flow, symbol)
+            if selected.empty:
+                continue
+            selected = selected.drop_duplicates("trading_date", keep="last").tail(5)
+            latest = selected.iloc[-1]
+            net = pd.to_numeric(selected["foreign_net_volume"], errors="coerce")
+            record: dict[str, Any] = {
+                "symbol": symbol,
+                "foreign_as_of": latest["trading_date"],
+                "foreign_source": latest["source"],
+                "foreign_session_count_5d": int(len(selected)),
+                "foreign_net_volume_5d": float(net.sum()),
+                "foreign_net_buy_sessions_5d": int(net.gt(0).sum()),
+                "foreign_net_sell_sessions_5d": int(net.lt(0).sum()),
+            }
+            for column in [
+                "foreign_buy_volume",
+                "foreign_sell_volume",
+                "foreign_net_volume",
+                "foreign_net_buy_volume",
+                "foreign_net_sell_volume",
+                "foreign_buy_value",
+                "foreign_sell_value",
+                "foreign_net_value",
+            ]:
+                if column in latest.index:
+                    record[column] = latest[column]
+            records.append(record)
+        return pd.DataFrame(records)
 
     def _latest_fundamentals(self) -> pd.DataFrame:
         source = self.reconciled_fundamentals
@@ -1368,6 +1809,7 @@ class AnalyticsPipeline:
             part = source[source["period_type"] == period_type].copy()
             if part.empty:
                 continue
+            part = part.sort_values("period").drop_duplicates("symbol", keep="last")
             keep = [
                 column
                 for column in [
@@ -1395,6 +1837,9 @@ class AnalyticsPipeline:
         result = pieces[0]
         for piece in pieces[1:]:
             result = result.merge(piece, on="symbol", how="outer", validate="one_to_one")
+        roe_ttm = self._calculate_roe_ttm()
+        if not roe_ttm.empty:
+            result = result.merge(roe_ttm, on="symbol", how="left", validate="one_to_one")
         return result
 
     @staticmethod
@@ -1418,34 +1863,30 @@ class AnalyticsPipeline:
             result = result.merge(fundamentals, on="symbol", how="left", validate="one_to_one")
         if not realtime.empty:
             latest = realtime.sort_values("timestamp_local").drop_duplicates("symbol", keep="last")
-            latest = latest[
-                ["symbol", "timestamp_local", "match_price", "match_quantity", "side", "total_volume"]
-            ].rename(columns={"timestamp_local": "realtime_as_of", "match_price": "realtime_price"})
-            result = result.merge(latest, on="symbol", how="left", validate="one_to_one")
-        if not foreign_flow.empty:
-            latest_foreign = foreign_flow.sort_values("collected_at").drop_duplicates(
-                "symbol", keep="last"
-            )
-            latest_foreign = latest_foreign[
-                [
-                    "symbol",
-                    "collected_at",
-                    "foreign_buy_volume",
-                    "foreign_sell_volume",
-                    "foreign_net_volume",
-                    "foreign_net_buy_volume",
-                    "foreign_net_sell_volume",
-                    "source",
-                ]
-            ].rename(
+            realtime_columns = [
+                column
+                for column in (
+                    "symbol", "timestamp_local", "match_price", "match_quantity",
+                    "side", "total_volume", "market_id", "board_id",
+                    "average_price", "open", "high", "low", "ceiling_price",
+                    "floor_price",
+                )
+                if column in latest.columns
+            ]
+            latest = latest[realtime_columns].rename(
                 columns={
-                    "collected_at": "foreign_as_of",
-                    "source": "foreign_source",
+                    "timestamp_local": "realtime_as_of",
+                    "match_price": "realtime_price",
                 }
             )
+            result = result.merge(latest, on="symbol", how="left", validate="one_to_one")
+        if not foreign_flow.empty:
+            latest_foreign = AnalyticsPipeline._summarize_foreign_flow(foreign_flow)
             result = result.merge(
                 latest_foreign, on="symbol", how="left", validate="one_to_one"
             )
+        result["price_unit_vnd"] = 1000.0
+        result["board_lot_size"] = 100
         return result
 
     @staticmethod
@@ -1533,6 +1974,7 @@ class AnalyticsPipeline:
     def _store_sqlite(self) -> None:
         table_frames = {
             "price_history": self.cleaned["history"],
+            "market_history": self.cleaned["market_history"],
             "realtime_quotes": self.cleaned["realtime"],
             "foreign_flow": self.cleaned["foreign_flow"],
             "fundamentals": self.cleaned["fundamentals"],
@@ -1540,6 +1982,7 @@ class AnalyticsPipeline:
             "screening": self.cleaned["screening"],
             "source_audit": self.source_audit,
             "data_quality": self.analysis["data_quality"],
+            "market_context": self.analysis["market_context"],
             "stock_snapshot": self.analysis["stock_snapshot"],
             "screening_ranked": self.analysis["screening_ranked"],
         }
@@ -1552,8 +1995,10 @@ class AnalyticsPipeline:
                     ON price_history(symbol, timestamp_utc);
                 CREATE INDEX IF NOT EXISTS idx_realtime_symbol_time
                     ON realtime_quotes(symbol, timestamp_local);
+                CREATE INDEX IF NOT EXISTS idx_market_symbol_time
+                    ON market_history(symbol, timestamp_utc);
                 CREATE INDEX IF NOT EXISTS idx_foreign_symbol_time
-                    ON foreign_flow(symbol, collected_at);
+                    ON foreign_flow(symbol, trading_date);
                 CREATE INDEX IF NOT EXISTS idx_fundamental_symbol_period
                     ON fundamentals(symbol, period_type, period);
                 CREATE INDEX IF NOT EXISTS idx_screening_symbol_period
