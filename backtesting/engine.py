@@ -146,11 +146,24 @@ def run_backtest(
             entry_price = _execution_price(open_price, "BUY", config)
             quantity = cash * config.position_size_pct / entry_price
             cash -= quantity * entry_price
+
+            structure_sl = None
+            if pending_buy.metadata.get("sl_source") == "ORDER_BLOCK":
+                if pending_buy.stop_loss and 0 < pending_buy.stop_loss < entry_price:
+                    structure_sl = pending_buy.stop_loss
+
+            structure_tp = None
+            if pending_buy.metadata.get("tp_source") in ("ORDER_BLOCK", "BOLLINGER_UPPER"):
+                if pending_buy.take_profit and pending_buy.take_profit > entry_price:
+                    structure_tp = pending_buy.take_profit
+
             position = {
                 "symbol": symbol,
                 "entry_date": date,
                 "entry_price": entry_price,
                 "quantity": quantity,
+                "stop_loss": structure_sl,
+                "take_profit": structure_tp,
             }
             pending_buy = None
 
@@ -172,6 +185,8 @@ def run_backtest(
                 position={
                     "has_position": True,
                     "entry_price": position["entry_price"],
+                    "stop_loss": position.get("stop_loss"),
+                    "take_profit": position.get("take_profit"),
                 },
                 session_low=low,
                 session_high=high,

@@ -73,7 +73,7 @@ class QualityTrendConfig:
     """Ngưỡng của quality_trend_v1, tách khỏi logic đánh giá."""
 
     roe_ttm_min: float = 0.15
-    debt_to_equity_max: float = 1.0
+    debt_to_equity_max: float = 2.0
     rsi_min: float = 50.0
     rsi_max: float = 70.0
     foreign_window: int = 5
@@ -86,8 +86,15 @@ class QualityTrendConfig:
     fundamental_weight: float = 0.25
     technical_weight: float = 0.35
     foreign_flow_weight: float = 0.20
+    confluence_k: int | None = 4
+    pure_asset_exit: bool = True
+    market_regime: str = "SMA20"
 
     def __post_init__(self) -> None:
+        if self.market_regime not in {"SMA20", "SMA50", "SMA200", "DUAL"}:
+            raise ValueError("market_regime phải là một trong {'SMA20', 'SMA50', 'SMA200', 'DUAL'}")
+        if self.confluence_k is not None and not (1 <= self.confluence_k <= 9):
+            raise ValueError("confluence_k phải nằm trong khoảng [1, 9]")
         if not 0 < self.roe_ttm_min <= 1:
             raise ValueError("roe_ttm_min phải nằm trong khoảng (0, 1]")
         if self.debt_to_equity_max <= 0:
@@ -261,6 +268,40 @@ class QualityTrendStrategy:
             )
         return reasons
 
+    def _market_gate_failed(self, market: MarketContext | None, regime: str) -> list[str]:
+        if market is None:
+            return []
+        m_c = market.close
+        m_s20 = market.sma_20
+        m_s50 = getattr(market, "sma_50", None)
+        m_s200 = getattr(market, "sma_200", None)
+        regime = (regime or "SMA20").strip().upper()
+
+        if regime == "SMA200":
+            if m_s200 is not None and not (m_c > m_s200):
+                return [f"Thị trường chung (VNINDEX) chưa thuận lợi dài hạn: Giá {m_c:.2f} <= SMA200 {m_s200:.2f}"]
+            if m_s200 is None and not (m_c > m_s20):
+                return [f"Thị trường chung (VNINDEX) chưa thuận lợi: Giá {m_c:.2f} <= SMA20 {m_s20:.2f}"]
+        elif regime == "DUAL":
+            dual_ok = True
+            if m_s50 is not None and not (m_c > m_s50):
+                dual_ok = False
+            if m_s200 is not None and not (m_c > m_s200):
+                dual_ok = False
+            if not dual_ok:
+                s50_s = f"{m_s50:.2f}" if m_s50 else "N/A"
+                s200_s = f"{m_s200:.2f}" if m_s200 else "N/A"
+                return [f"Thị trường chung (VNINDEX) chưa thuận lợi: Giá {m_c:.2f} không vượt cả SMA50 ({s50_s}) và SMA200 ({s200_s})"]
+        elif regime == "SMA50":
+            if m_s50 is not None and not (m_c > m_s50):
+                return [f"Thị trường chung (VNINDEX) chưa thuận lợi trung hạn: Giá {m_c:.2f} <= SMA50 {m_s50:.2f}"]
+            if m_s50 is None and not (m_c > m_s20):
+                return [f"Thị trường chung (VNINDEX) chưa thuận lợi: Giá {m_c:.2f} <= SMA20 {m_s20:.2f}"]
+        else:
+            if not (m_c > m_s20):
+                return [f"Thị trường chung (VNINDEX) chưa thuận lợi: Giá {m_c:.2f} <= SMA20 {m_s20:.2f}"]
+        return []
+
     def _evaluate_entry(
         self,
         *,
@@ -376,45 +417,127 @@ class QualityTrendStrategy:
 
         # Phân nhánh BUY cho NGẮN HẠN (Kỹ thuật / Momentum) hoặc CẢ HAI
         failed = []
-        if request.market is not None and not (request.market.close > request.market.sma_20):
-            failed.append(f"Thị trường chung (VNINDEX) chưa thuận lợi: Giá {request.market.close:.2f} <= SMA20 {request.market.sma_20:.2f}")
+        is_short_term = (investment_mode == "SHORT_TERM")
+        max_de = _number(snapshot, "debt_to_equity_max", "de_max") or self.config.debt_to_equity_max
+        confluence_k_val = _number(snapshot, "confluence_k")
+        if confluence_k_val is None:
+            confluence_k_val = getattr(self.config, "confluence_k", None)
+        confluence_k = int(confluence_k_val) if confluence_k_val is not None else None
+        criteria_details: list[str] = []
+        criteria_passed: int = 0
+        total_confluence_n = 6 if is_short_term else 8
 
-        if roe_ttm is not None and roe_ttm < self.config.roe_ttm_min:
-            failed.append(f"Cơ bản yếu: ROE TTM = {roe_ttm*100:.1f}% dưới mức tối thiểu {self.config.roe_ttm_min*100:.1f}%")
+        if confluence_k is not None:
+            # ── HYBRID CONFLUENCE MODE (Tầng 1: 4 Hard Gates + Tầng 2: Confluence K/N) ──
+            hard_failed = []
+            market_regime = str(snapshot.get("market_regime") or getattr(self.config, "market_regime", "SMA20")).strip().upper()
+            m_failed = self._market_gate_failed(request.market, market_regime)
+            if m_failed:
+                hard_failed.extend(m_failed)
 
-        if not is_financial and debt_to_equity is not None and debt_to_equity > self.config.debt_to_equity_max:
-            failed.append(f"Cơ bản yếu: D/E = {debt_to_equity:.2f} vượt ngưỡng an toàn {self.config.debt_to_equity_max}")
+            if sma_20 is not None and close <= sma_20:
+                hard_failed.append(f"Xu hướng yếu: Giá {close:.2f} nằm dưới SMA20 {sma_20:.2f}")
 
-        if sma_20 is not None and close <= sma_20:
-            failed.append(f"Xu hướng yếu: Giá {close:.2f} nằm dưới SMA20 {sma_20:.2f}")
+            if sma_20 is not None and sma_50 is not None and sma_20 <= sma_50:
+                hard_failed.append(f"Cấu trúc xu hướng gãy: SMA20 ({sma_20:.2f}) nằm dưới hoặc bằng SMA50 ({sma_50:.2f})")
 
-        if sma_20 is not None and sma_50 is not None and sma_20 <= sma_50:
-            failed.append(f"Xu hướng yếu: SMA20 ({sma_20:.2f}) nằm dưới SMA50 ({sma_50:.2f})")
+            if foreign.session_count >= self.config.foreign_window and foreign.net_volume < 0 and foreign.net_sell_sessions >= 4:
+                hard_failed.append(f"Khối ngoại xả thảm họa: Bán ròng mạnh 4/5 phiên ({foreign.net_volume:,.0f})")
 
-        if not (self.config.rsi_min <= rsi_14 <= self.config.rsi_max):
-            failed.append(f"Động lượng yếu: RSI(14) = {rsi_14:.2f} không nằm trong khoảng yêu cầu ({self.config.rsi_min:.0f}-{self.config.rsi_max:.0f})")
+            if hard_failed:
+                failed = hard_failed
+            else:
+                # Tầng 2: 6 Tiêu chí Kỹ thuật & Dòng tiền (N=6)
+                c1 = bool(self.config.rsi_min <= rsi_14 <= self.config.rsi_max)
+                if c1:
+                    criteria_passed += 1
+                    criteria_details.append("RSI 50-70")
 
-        if macd <= macd_signal:
-            failed.append(f"Động lượng yếu: MACD ({macd:.3f}) nằm dưới đường tín hiệu ({macd_signal:.3f})")
+                c2 = bool(macd > macd_signal)
+                if c2:
+                    criteria_passed += 1
+                    criteria_details.append("MACD>Signal")
 
-        if foreign.session_count >= self.config.foreign_window and foreign.net_volume < 0 and foreign.net_sell_sessions >= 4:
-            failed.append(f"Dòng tiền yếu: Khối ngoại bán ròng mạnh trong 5 phiên ({foreign.net_volume:,.0f})")
+                c3 = bool(volume_ratio is None or volume_ratio >= 0.8)
+                if c3:
+                    criteria_passed += 1
+                    criteria_details.append("Volume>=0.8x")
 
-        # ── BỘ LỌC TINH CHỈNH MỚI CHO BUY NGẮN HẠN ──
-        # 1. Chặn bẫy mua rướn đỉnh dải trên Bollinger Bands:
-        if bollinger_upper is not None and close > bollinger_upper * 1.01:
-            if bollinger_bandwidth is None or bollinger_bandwidth < 0.08:
-                failed.append(f"Giá tiệm cận/vượt dải trên Bollinger ({close:,.0f} > {bollinger_upper:,.0f}) trong dải nén — rủi ro mua đỉnh ngắn hạn")
+                c4 = bool(ob_resistance is None or close >= ob_resistance or ((ob_resistance - close) / close >= 0.035))
+                if c4:
+                    criteria_passed += 1
+                    criteria_details.append("OB dư địa>=3.5%")
 
-        # 2. Xác nhận khối lượng (Volume Confirmation - Chống Bull Trap):
-        if volume_ratio is not None and volume_ratio < 0.8:
-            failed.append(f"Thanh khoản yếu ({volume_ratio:.2f}x bình quân 20 phiên) — thiếu xác nhận dòng tiền lớn")
+                c5 = bool(foreign.session_count > 0 and (foreign.net_volume > 0 or foreign.net_buy_sessions >= self.config.foreign_min_positive_sessions))
+                if c5:
+                    criteria_passed += 1
+                    criteria_details.append("Khối ngoại gom ròng")
 
-        # 3. Dư địa tăng tới kháng cự Order Block (Risk/Reward):
-        if ob_resistance is not None and close < ob_resistance:
-            upside_pct = (ob_resistance - close) / close
-            if upside_pct < 0.035:
-                failed.append(f"Giá ({close:,.0f}) nằm quá sát cản Order Block ({ob_resistance:,.0f}) — biên lãi < 3.5% không tối ưu Risk/Reward")
+                c6 = not bool(bollinger_upper is not None and close > bollinger_upper * 1.01 and (bollinger_bandwidth is None or bollinger_bandwidth < 0.08))
+                if c6:
+                    criteria_passed += 1
+                    criteria_details.append("Bollinger an toàn")
+
+                if not is_short_term:
+                    # Chế độ BOTH: Bổ sung 2 tiêu chí cơ bản vào Confluence (N=8)
+                    c7 = bool(is_financial or debt_to_equity is None or debt_to_equity <= max_de)
+                    if c7:
+                        criteria_passed += 1
+                        criteria_details.append(f"D/E<={max_de:.1f}")
+
+                    c8 = bool(roe_ttm is None or roe_ttm >= self.config.roe_ttm_min)
+                    if c8:
+                        criteria_passed += 1
+                        criteria_details.append(f"ROE>={self.config.roe_ttm_min*100:.0f}%")
+
+                if criteria_passed >= confluence_k:
+                    failed = []
+                else:
+                    failed = [f"Chưa đạt ngưỡng Confluence: {criteria_passed}/{total_confluence_n} tiêu chí đạt (yêu cầu >={confluence_k})"]
+        else:
+            # ── BASELINE MODE (Toán tử AND cứng) ──
+            market_regime = str(snapshot.get("market_regime") or getattr(self.config, "market_regime", "SMA20")).strip().upper()
+            m_failed = self._market_gate_failed(request.market, market_regime)
+            if m_failed:
+                failed.extend(m_failed)
+
+            if not is_short_term:
+                if roe_ttm is not None and roe_ttm < self.config.roe_ttm_min:
+                    failed.append(f"Cơ bản yếu: ROE TTM = {roe_ttm*100:.1f}% dưới mức tối thiểu {self.config.roe_ttm_min*100:.1f}%")
+
+                if not is_financial and debt_to_equity is not None and debt_to_equity > max_de:
+                    failed.append(f"Cơ bản yếu: D/E = {debt_to_equity:.2f} vượt ngưỡng an toàn {max_de:.2f}")
+
+            if sma_20 is not None and close <= sma_20:
+                failed.append(f"Xu hướng yếu: Giá {close:.2f} nằm dưới SMA20 {sma_20:.2f}")
+
+            if sma_20 is not None and sma_50 is not None and sma_20 <= sma_50:
+                failed.append(f"Xu hướng yếu: SMA20 ({sma_20:.2f}) nằm dưới SMA50 ({sma_50:.2f})")
+
+            if not (self.config.rsi_min <= rsi_14 <= self.config.rsi_max):
+                failed.append(f"Động lượng yếu: RSI(14) = {rsi_14:.2f} không nằm trong khoảng yêu cầu ({self.config.rsi_min:.0f}-{self.config.rsi_max:.0f})")
+
+            if macd <= macd_signal:
+                failed.append(f"Động lượng yếu: MACD ({macd:.3f}) nằm dưới đường tín hiệu ({macd_signal:.3f})")
+
+            if foreign.session_count >= self.config.foreign_window and foreign.net_volume < 0 and foreign.net_sell_sessions >= 4:
+                failed.append(f"Dòng tiền yếu: Khối ngoại bán ròng mạnh trong 5 phiên ({foreign.net_volume:,.0f})")
+
+            # ── BỘ LỌC TINH CHỈNH MỚI CHO BUY NGẮN HẠN ──
+            # 1. Chặn bẫy mua rướn đỉnh dải trên Bollinger Bands:
+            if bollinger_upper is not None and close > bollinger_upper * 1.01:
+                if bollinger_bandwidth is None or bollinger_bandwidth < 0.08:
+                    failed.append(f"Giá tiệm cận/vượt dải trên Bollinger ({close:,.0f} > {bollinger_upper:,.0f}) trong dải nén — rủi ro mua đỉnh ngắn hạn")
+
+            # 2. Xác nhận khối lượng (Volume Confirmation - Chống Bull Trap):
+            if volume_ratio is not None and volume_ratio < 0.8:
+                failed.append(f"Thanh khoản yếu ({volume_ratio:.2f}x bình quân 20 phiên) — thiếu xác nhận dòng tiền lớn")
+
+            # 3. Dư địa tăng tới kháng cự Order Block (Risk/Reward):
+            if ob_resistance is not None and close < ob_resistance:
+                upside_pct = (ob_resistance - close) / close
+                if upside_pct < 0.035:
+                    failed.append(f"Giá ({close:,.0f}) nằm quá sát cản Order Block ({ob_resistance:,.0f}) — biên lãi < 3.5% không tối ưu Risk/Reward")
 
         # ── 2. NẾU THỎA MÃN BUY -> XUẤT TÍN HIỆU BUY ────────────────
         if not failed:
@@ -444,11 +567,18 @@ class QualityTrendStrategy:
                 ),
                 2,
             )
-            reasons = [
-                "Tất cả các điều kiện BUY kỹ thuật & xu hướng đều thỏa mãn!",
-                f"Chiến lược Xu hướng & MA: Giá ({close:,.0f}) > SMA20 ({sma_20:,.0f}) > SMA50 ({sma_50:,.0f}) — Xác nhận sóng tăng.",
-                f"Chiến lược Động lượng (RSI & MACD): RSI(14) = {rsi_14:.1f} chuẩn đà tăng | MACD ({macd:.3f}) cắt lên trên Signal ({macd_signal:.3f}).",
-            ]
+            if confluence_k is not None:
+                reasons = [
+                    f"Đạt mô hình Hybrid Confluence ({criteria_passed}/{total_confluence_n} tiêu chí: {', '.join(criteria_details)})",
+                    f"Chiến lược Xu hướng & MA: Giá ({close:,.0f}) trên SMA20 ({sma_20:,.0f}) — Cấu trúc tăng giữ vững.",
+                    f"Chiến lược Động lượng (RSI & MACD): RSI(14) = {rsi_14:.1f} | MACD ({macd:.3f}) so với Signal ({macd_signal:.3f}).",
+                ]
+            else:
+                reasons = [
+                    "Tất cả các điều kiện BUY kỹ thuật & xu hướng đều thỏa mãn!",
+                    f"Chiến lược Xu hướng & MA: Giá ({close:,.0f}) > SMA20 ({sma_20:,.0f}) > SMA50 ({sma_50:,.0f}) — Xác nhận sóng tăng.",
+                    f"Chiến lược Động lượng (RSI & MACD): RSI(14) = {rsi_14:.1f} chuẩn đà tăng | MACD ({macd:.3f}) cắt lên trên Signal ({macd_signal:.3f}).",
+                ]
             if foreign.session_count > 0:
                 reasons.append(
                     f"Chiến lược Dòng tiền Khối ngoại: Mua ròng {foreign.net_volume:+,.0f} cp ({foreign.net_buy_sessions}/{foreign.session_count} phiên) hỗ trợ lực cầu."
@@ -506,6 +636,7 @@ class QualityTrendStrategy:
                     "ob_resistance": ob_resistance,
                     "user_sl_pct": user_sl_pct,
                     "user_tp_pct": user_tp_pct,
+                    **({"confluence_k": confluence_k, "confluence_score": criteria_passed, "confluence_criteria": criteria_details} if confluence_k is not None else {}),
                 },
             )
 
@@ -600,7 +731,8 @@ class QualityTrendStrategy:
         if investment_mode == "LONG_TERM":
             hold_reasons.append("🏛 [DÀI HẠN] Định giá doanh nghiệp đang ở mức hợp lý.")
             if pe_val:
-                hold_reasons.append(f"• Định giá: P/E = {pe_val:.1f} | P/B = {pb_val:.1f if pb_val else '—'}")
+                pb_str = f"{pb_val:.1f}" if pb_val else "—"
+                hold_reasons.append(f"• Định giá: P/E = {pe_val:.1f} | P/B = {pb_str}")
             if roe_ttm:
                 hold_reasons.append(f"• Hiệu quả hoạt động: ROE TTM = {roe_ttm*100:.1f}%")
             hold_reasons.append("Chưa xuất hiện sự kiện trọng yếu hoặc định giá chiết khấu đủ sâu để tích sản thêm.")
@@ -696,35 +828,42 @@ class QualityTrendStrategy:
     ) -> SignalEvent:
         assert request.position.entry_price is not None
         entry_price = request.position.entry_price
-        stop_loss = entry_price * (1 - self.config.stop_loss_pct)
-        take_profit = entry_price * (1 + self.config.take_profit_pct)
+        stop_loss = request.position.stop_loss or (entry_price * (1 - self.config.stop_loss_pct))
+        take_profit = request.position.take_profit or (entry_price * (1 + self.config.take_profit_pct))
         session_low = request.session_low if request.session_low is not None else close
         session_high = request.session_high if request.session_high is not None else close
+
+        snapshot = request.snapshot
+        pure_asset_exit = _bool_value(snapshot.get("pure_asset_exit"))
+        if pure_asset_exit is None:
+            pure_asset_exit = getattr(self.config, "pure_asset_exit", True)
 
         sell_reason: str | None = None
         sell_trigger: str | None = None
         if session_low <= stop_loss:
             sell_trigger = "STOP_LOSS"
+            sl_pct = (stop_loss - entry_price) / entry_price
             sell_reason = (
                 f"Stop Loss: giá thấp nhất {session_low:,.2f} chạm ngưỡng "
-                f"{stop_loss:,.2f} (-{self.config.stop_loss_pct:.0%})"
+                f"{stop_loss:,.2f} ({sl_pct:+.1%})"
             )
         elif session_high >= take_profit:
             sell_trigger = "TAKE_PROFIT"
+            tp_pct = (take_profit - entry_price) / entry_price
             sell_reason = (
                 f"Take Profit: giá cao nhất {session_high:,.2f} chạm ngưỡng "
-                f"{take_profit:,.2f} (+{self.config.take_profit_pct:.0%})"
+                f"{take_profit:,.2f} ({tp_pct:+.1%})"
             )
         elif sma_20 is not None and sma_50 is not None and sma_20 < sma_50:
             sell_trigger = "TREND_EXIT"
             sell_reason = "Trend Exit: SMA20 đã nằm dưới SMA50"
-        elif (
+        elif not pure_asset_exit and (
             request.market is not None
             and request.market.close <= request.market.sma_20
         ):
             sell_trigger = "MARKET_EXIT"
             sell_reason = "Market Exit: chỉ số thị trường đã đóng cửa dưới hoặc bằng SMA20"
-        elif (
+        elif not pure_asset_exit and (
             foreign.session_count >= self.config.foreign_window
             and foreign.net_volume < 0
             and foreign.net_sell_sessions >= self.config.foreign_min_negative_sessions

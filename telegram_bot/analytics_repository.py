@@ -218,13 +218,31 @@ class AnalyticsRepository:
             ), None
 
         realtime_p = values.get("realtime_price")
-        yesterday_c = values.get("latest_close")
+        latest_c = values.get("latest_close")
+        prev_c = values.get("previous_close")
         unit = float(values.get("price_unit_vnd") or 1000.0)
+
+        # Xác định giá tham chiếu chuẩn (phiên liền trước):
+        # Nếu nến latest_close đã là nến của ngày hôm nay (cùng ngày với realtime), giá tham chiếu là previous_close.
+        # Nếu nến latest_close là nến của hôm qua (chưa cập nhật nến hôm nay), giá tham chiếu là latest_close.
+        ref_price = None
+        price_date = str(values.get("price_as_of") or "")[:10]
+        realtime_date = str(values.get("realtime_as_of") or "")[:10]
+        if price_date and realtime_date and price_date == realtime_date and prev_c is not None and prev_c > 0:
+            ref_price = prev_c
+        elif latest_c is not None and latest_c > 0:
+            if prev_c is not None and prev_c > 0 and realtime_p is not None and math.isclose(latest_c, realtime_p, rel_tol=1e-5):
+                ref_price = prev_c
+            else:
+                ref_price = latest_c
+        elif prev_c is not None and prev_c > 0:
+            ref_price = prev_c
+
         p_change = None
         p_change_pct = None
-        if realtime_p is not None and yesterday_c is not None and yesterday_c > 0:
-            p_change = (realtime_p - yesterday_c) * unit
-            p_change_pct = (realtime_p - yesterday_c) / yesterday_c * 100.0
+        if realtime_p is not None and ref_price is not None and ref_price > 0:
+            p_change = (realtime_p - ref_price) * unit
+            p_change_pct = (realtime_p - ref_price) / ref_price * 100.0
 
         metrics = {
             key: values.get(key)
@@ -260,7 +278,17 @@ class AnalyticsRepository:
         }
         metrics["price_change"] = p_change
         metrics["price_change_pct"] = p_change_pct
-        metrics["volume"] = values.get("total_volume") or values.get("latest_volume")
+
+        # Chuẩn hóa khối lượng:
+        # Nếu có latest_volume từ lịch sử nến ngày (đã là số cp chuẩn), ưu tiên sử dụng.
+        # Nếu dùng total_volume từ DNSE realtime OpenAPI (vốn gửi theo lô 10 cp), nhân 10 để ra số lượng cp thực tế.
+        raw_vol = values.get("latest_volume")
+        tot_v = values.get("total_volume")
+        if tot_v is not None and tot_v > 0:
+            norm_tot_v = float(tot_v) * 10.0 if float(tot_v) < 50_000_000 else float(tot_v)
+            if raw_vol is None or norm_tot_v >= raw_vol:
+                raw_vol = norm_tot_v
+        metrics["volume"] = raw_vol
 
         display_price = event.reference_price or values.get("realtime_price") or values.get("latest_close")
 

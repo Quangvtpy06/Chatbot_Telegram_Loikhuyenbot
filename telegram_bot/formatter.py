@@ -168,10 +168,11 @@ def format_market(vnindex_data: dict, vn30_data: dict) -> str:
             return f"<b>{name}:</b> Không có dữ liệu"
 
         c = data.get("c", 0.0)
-        o = data.get("o", 0.0)
+        # Ưu tiên so sánh với giá tham chiếu phiên trước (prev_c) thay vì giá mở cửa (o)
+        ref = data.get("prev_c") or data.get("o", 0.0)
         v = data.get("v", 0.0)
-        diff = c - o
-        pct = (diff / o * 100) if o > 0 else 0
+        diff = c - ref
+        pct = (diff / ref * 100) if ref > 0 else 0
 
         icon = "🟢" if diff > 0 else "🔴" if diff < 0 else "🟡"
         sign = "+" if diff > 0 else ""
@@ -179,7 +180,7 @@ def format_market(vnindex_data: dict, vn30_data: dict) -> str:
         return (
             f"{icon} <b>{name}</b>: <code>{c:,.2f}</code> "
             f"({sign}{diff:,.2f} | {sign}{pct:,.2f}%)\n"
-            f"   Khối lượng: <code>{v:,.0f}</code>"
+            f"   Khối lượng: <code>{v:,.0f} cp</code>"
         )
 
     return (
@@ -231,7 +232,10 @@ def format_check(
     if price_parts:
         lines.append(f"💵 <b>Giá hiện tại:</b> {' '.join(price_parts)}")
 
-    vol = volume or metrics.get("volume") or metrics.get("total_volume")
+    vol = volume or metrics.get("volume") or metrics.get("latest_volume")
+    if not vol and metrics.get("total_volume"):
+        raw_tv = float(metrics["total_volume"])
+        vol = raw_tv * 10.0 if raw_tv < 50_000_000 else raw_tv
     if vol:
         lines.append(f"📦 <b>Khối lượng:</b> <code>{vol:,.0f} cp</code>")
 
@@ -463,23 +467,21 @@ def format_signal_single(view: SignalView, decision: Any = None) -> str:
             for br in block_reasons:
                 reason = str(br or "")
                 if "Khoảng cách cắt lỗ quá xa" in reason or "> 20%" in reason:
-                    block_msg = "⛔️ <b>TỪ CHỐI MỞ VỊ THẾ (RỦI RO BIÊN ĐỘ CẮT LỖ &gt; 20%)</b>"
+                    block_msg = "Khoảng cách cắt lỗ quá xa (> 20%) — Khuyến nghị thu hẹp tỷ trọng để bảo toàn vốn."
                     break
                 if "R:R" in reason and "< ngưỡng" in reason:
-                    block_msg = "⚠️ <b>TỪ CHỐI MỞ VỊ THẾ (TỶ LỆ R:R &lt; 2.0 KHÔNG ĐỦ HẤP DẪN)</b>"
+                    block_msg = "Tỷ lệ Lời/Lỗ (R:R) < 2.0 — Biên lợi nhuận mỏng so với rủi ro; cân nhắc giải ngân tỷ trọng thăm dò hoặc chờ điểm vào tối ưu hơn."
                     break
             if not block_msg:
-                block_msg = f"⛔️ <b>TỪ CHỐI MỞ VỊ THẾ (RISK GATE BLOCKED)</b>"
+                reasons_str = "; ".join(str(r) for r in block_reasons if r)
+                block_msg = f"Chưa thỏa mãn tiêu chuẩn giải ngân danh mục an toàn ({reasons_str})."
 
         for ar in allow_reasons:
             reason = str(ar or "")
             if "sàn rủi ro 1.0%" in reason or "sàn stop distance" in reason:
                 applied_floor_note = True
 
-    if is_blocked:
-        icon = "⛔️"
-        act_text = block_msg
-    elif action == "BUY":
+    if action == "BUY":
         icon = "🟢"
         act_text = "MUA (BUY)"
     elif action == "SELL":
@@ -494,7 +496,7 @@ def format_signal_single(view: SignalView, decision: Any = None) -> str:
 
     lines = [
         f"📈 <b>BÁO ĐỘNG TÍN HIỆU: {symbol}</b>",
-        f"🎯 <b>Hành động:</b> {icon} <b>{act_text}</b>" if not is_blocked else f"🎯 <b>Trạng thái:</b> {act_text}",
+        f"🎯 <b>Hành động:</b> {icon} <b>{act_text}</b>",
     ]
 
     if action == "HOLD":
@@ -559,6 +561,9 @@ def format_signal_single(view: SignalView, decision: Any = None) -> str:
             lines.append(f"🛑 <b>Vùng cản trên / Cắt lỗ:</b> <code>{sl:,.0f} đ</code>")
         if tp:
             lines.append(f"🎯 <b>Ngưỡng hỗ trợ kỳ vọng:</b> <code>{tp:,.0f} đ</code>")
+
+    if is_blocked and block_msg:
+        lines.append(f"\n🛡 <b>Lưu ý Quản trị rủi ro:</b> <i>{block_msg}</i>")
 
     if applied_floor_note:
         lines.append(

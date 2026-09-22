@@ -98,11 +98,12 @@ Một mã cổ phiếu được kích hoạt trạng thái **BUY** khi thỏa m�
   $$
 - Hệ số Đòn bẩy Tài chính:
   $$
-  \frac{\text{Tổng Nợ Vay}}{\text{Vốn Chủ Sở Hữu}} \le 1.0 \quad (D/E \le 1.0)
+  \frac{\text{Tổng Nợ Vay}}{\text{Vốn Chủ Sở Hữu}} \le 2.0 \quad (D/E \le 2.0)
   $$
+  *(Hỗ trợ cấu hình tùy biến linh hoạt qua tham số `de_max`)*.
 
   > **Quy tắc Ngoại lệ Ngành (Financial Sector Exemption):**
-  > Tự động miễn trừ điều kiện $D/E \le 1.0$ cho nhóm ngành Tài chính, Ngân hàng, Chứng khoán (`banking`, `securities`, `finance`) do đặc thù mô hình kinh doanh sử dụng đòn bẩy tiền gửi/huy động cao.
+  > Tự động miễn trừ điều kiện $D/E \le 2.0$ cho nhóm ngành Tài chính, Ngân hàng, Chứng khoán (`banking`, `securities`, `finance`) do đặc thù mô hình kinh doanh sử dụng đòn bẩy tiền gửi/huy động cao. Với các tập đoàn đa ngành, sản xuất lớn như MSN, MWG, REE, HPG, ngưỡng an toàn $D/E \le 2.0$ giúp tránh chặn nhầm cơ hội tăng giá.
   >
 
 #### Lớp 3: Cấu trúc Xu hướng & Động lượng Kỹ thuật (Technical Filter)

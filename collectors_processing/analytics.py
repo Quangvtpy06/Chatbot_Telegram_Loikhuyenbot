@@ -724,7 +724,8 @@ class AnalyticsPipeline:
         result["match_quantity"] = data["matchQtty"].round().astype("Int64")
         result["side"] = data.get("side", pd.Series(index=data.index, dtype="object")).astype("string").str.upper()
         result["average_price"] = data["avgPrice"]
-        result["total_volume"] = data["totalVolumeTraded"].round().astype("Int64")
+        # DNSE OpenAPI totalVolumeTraded trả về theo đơn vị lô 10 cp; quy đổi x10 sang số lượng cổ phiếu thực tế
+        result["total_volume"] = (data["totalVolumeTraded"] * 10).round().astype("Int64")
         result["open"] = data["openPrice"]
         result["high"] = data["highestPrice"]
         result["low"] = data["lowestPrice"]

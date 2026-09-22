@@ -157,6 +157,31 @@ def _run_analytics(symbol: str, config: BotConfig) -> None:
     pipeline.run()
 
 
+def _fetch_index_data_from_vnstock(symbol: str) -> dict[str, Any]:
+    """Lấy dữ liệu chỉ số thị trường (VNINDEX, VN30) bao gồm tổng khối lượng chuẩn từ VCI/vnstock."""
+    import contextlib
+    import os
+    try:
+        with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+            from vnstock.api.quote import Quote
+            end_date = datetime.now(VIETNAM_TIMEZONE).strftime("%Y-%m-%d")
+            start_date = (datetime.now(VIETNAM_TIMEZONE) - timedelta(days=7)).strftime("%Y-%m-%d")
+            q = Quote(symbol=symbol, source="VCI", show_log=False)
+            df = q.history(start=start_date, end=end_date)
+            if df is not None and len(df) >= 2:
+                last_row = df.iloc[-1]
+                prev_row = df.iloc[-2]
+                return {
+                    "c": float(last_row["close"]),
+                    "prev_c": float(prev_row["close"]),
+                    "v": int(last_row["volume"]),
+                    "symbol": symbol,
+                }
+    except Exception as exc:
+        LOGGER.warning("Không thể lấy dữ liệu index %s từ vnstock: %s", symbol, exc)
+    return {}
+
+
 class BotHandlers:
     """Điều phối lệnh, phân quyền và giới hạn tần suất đơn giản."""
 
@@ -697,27 +722,44 @@ class BotHandlers:
             "⏳ Đang lấy dữ liệu thị trường (VNINDEX, VN30)..."
         )
 
-        client = DNSEClient(DNSEConfig())
         try:
-            end_date = datetime.now(VIETNAM_TIMEZONE).strftime("%Y-%m-%d")
-            start_date = (datetime.now(VIETNAM_TIMEZONE) - timedelta(days=5)).strftime("%Y-%m-%d")
+            # 1. Ưu tiên lấy từ vnstock để có tổng khối lượng chuẩn khớp 100% với bảng điện (khớp lệnh + thỏa thuận)
+            vnindex_data = await asyncio.to_thread(_fetch_index_data_from_vnstock, "VNINDEX")
+            vn30_data = await asyncio.to_thread(_fetch_index_data_from_vnstock, "VN30")
 
-            vnindex_history = await asyncio.to_thread(
-                client.fetch_history, "VNINDEX", start_date, end_date, "1D", "INDEX"
-            )
-            vn30_history = await asyncio.to_thread(
-                client.fetch_history, "VN30", start_date, end_date, "1D", "INDEX"
-            )
+            # 2. Fallback sang DNSE client nếu vnstock thiếu dữ liệu
+            if not vnindex_data or not vn30_data:
+                client = DNSEClient(DNSEConfig())
+                try:
+                    end_date = datetime.now(VIETNAM_TIMEZONE).strftime("%Y-%m-%d")
+                    start_date = (datetime.now(VIETNAM_TIMEZONE) - timedelta(days=7)).strftime("%Y-%m-%d")
 
-            vnindex_data = vnindex_history[-1] if vnindex_history else {}
-            vn30_data = vn30_history[-1] if vn30_history else {}
+                    if not vnindex_data:
+                        vnindex_history = await asyncio.to_thread(
+                            client.fetch_history, "VNINDEX", start_date, end_date, "1D", "INDEX"
+                        )
+                        if len(vnindex_history) >= 2:
+                            vnindex_data = dict(vnindex_history[-1])
+                            vnindex_data["prev_c"] = vnindex_history[-2].get("c")
+                        else:
+                            vnindex_data = dict(vnindex_history[-1]) if vnindex_history else {}
+
+                    if not vn30_data:
+                        vn30_history = await asyncio.to_thread(
+                            client.fetch_history, "VN30", start_date, end_date, "1D", "INDEX"
+                        )
+                        if len(vn30_history) >= 2:
+                            vn30_data = dict(vn30_history[-1])
+                            vn30_data["prev_c"] = vn30_history[-2].get("c")
+                        else:
+                            vn30_data = dict(vn30_history[-1]) if vn30_history else {}
+                finally:
+                    client.close()
 
             await self._reply(update, format_market(vnindex_data, vn30_data))
         except Exception as exc:
             LOGGER.exception("Lỗi khi lấy dữ liệu market")
             await self._reply(update, "❌ Có lỗi xảy ra khi lấy dữ liệu thị trường.")
-        finally:
-            client.close()
 
     async def chart(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Vẽ biểu đồ Bollinger Bands cho một mã."""

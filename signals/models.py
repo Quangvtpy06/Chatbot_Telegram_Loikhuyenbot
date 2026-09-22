@@ -29,6 +29,8 @@ class MarketContext:
 
     close: float
     sma_20: float
+    sma_50: float | None = None
+    sma_200: float | None = None
     symbol: str = "VNINDEX"
     as_of: str | None = None
 
@@ -37,6 +39,10 @@ class MarketContext:
             raise ValueError("market.close phải là số dương hữu hạn")
         if not math.isfinite(self.sma_20) or self.sma_20 <= 0:
             raise ValueError("market.sma_20 phải là số dương hữu hạn")
+        if self.sma_50 is not None and (not math.isfinite(self.sma_50) or self.sma_50 <= 0):
+            raise ValueError("market.sma_50 phải là số dương hữu hạn")
+        if self.sma_200 is not None and (not math.isfinite(self.sma_200) or self.sma_200 <= 0):
+            raise ValueError("market.sma_200 phải là số dương hữu hạn")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "MarketContext":
@@ -46,11 +52,19 @@ class MarketContext:
         sma_20 = _finite_number(
             value.get("sma_20", value.get("market_sma_20", value.get("index_sma_20")))
         )
+        sma_50 = _finite_number(
+            value.get("sma_50", value.get("market_sma_50", value.get("index_sma_50")))
+        )
+        sma_200 = _finite_number(
+            value.get("sma_200", value.get("market_sma_200", value.get("index_sma_200")))
+        )
         if close is None or sma_20 is None:
             raise ValueError("MarketContext cần close và sma_20")
         return cls(
             close=close,
             sma_20=sma_20,
+            sma_50=sma_50,
+            sma_200=sma_200,
             symbol=str(value.get("symbol") or value.get("market_symbol") or "VNINDEX"),
             as_of=str(value["as_of"]) if value.get("as_of") else None,
         )
@@ -155,6 +169,8 @@ class PositionContext:
 
     has_position: bool = False
     entry_price: float | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
 
     def __post_init__(self) -> None:
         if self.has_position and (
@@ -163,6 +179,10 @@ class PositionContext:
             or self.entry_price <= 0
         ):
             raise ValueError("Vị thế đang mở phải có entry_price dương hữu hạn")
+        if self.stop_loss is not None and (not math.isfinite(self.stop_loss) or self.stop_loss <= 0):
+            raise ValueError("stop_loss vị thế phải là số dương hữu hạn")
+        if self.take_profit is not None and (not math.isfinite(self.take_profit) or self.take_profit <= 0):
+            raise ValueError("take_profit vị thế phải là số dương hữu hạn")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "PositionContext":
@@ -176,6 +196,8 @@ class PositionContext:
             entry_price=_finite_number(
                 value.get("entry_price", value.get("position_reference_price"))
             ),
+            stop_loss=_finite_number(value.get("stop_loss")),
+            take_profit=_finite_number(value.get("take_profit")),
         )
 
 
