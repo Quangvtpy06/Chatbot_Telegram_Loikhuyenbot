@@ -62,13 +62,14 @@ Hệ thống quản lý nghiêm ngặt 3 trạng thái xuyên suốt toàn bộ 
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                           NGUỒN DỮ LIỆU ĐẦU VÀO                         │
 │   • DNSE OpenAPI (Giá realtime, OHLCV lịch sử, GD Khối ngoại 5 phiên)   │
-│   • Vnstock / VCI / KBS (Báo cáo tài chính quý/năm, Chỉ số cơ bản)      │
+│   • Vnstock/ Vnfinancialdata / VCI / KBS (Báo cáo tài chính quý/năm,    │
+│   Chỉ số cơ bản)                                                        │       
 └────────────────────────────────────┬────────────────────────────────────┘
                                      │
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                    THU THẬP DỮ LIỆU (DATA CRAWLERS)                     │
-│  [collectors_processing/dnse_api_crawl.py & hybrid_fundamental.py]     │
+│  [collectors_processing/dnse_api_crawl.py & hybrid_fundamental.py]      │
 │   • Retry cơ chế Exponential Backoff • Fallback nguồn dự phòng          │
 │   • Chống look-ahead bias (Ước tính ngày công bố BCTC +30 ngày)         │
 └────────────────────────────────────┬────────────────────────────────────┘
@@ -77,7 +78,7 @@ Hệ thống quản lý nghiêm ngặt 3 trạng thái xuyên suốt toàn bộ 
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                   KIỂM ĐỊNH & PHÂN TÍCH (ANALYTICS ENGINE)              │
 │  [collectors_processing/analytics.py]                                   │
-│   • Data Quality Gate (Lọc NaN, Anomaly, Stale Data)                   │
+│   • Data Quality Gate (Lọc NaN, Anomaly, Stale Data)                    │
 │   • 15+ Chỉ báo Kỹ thuật (SMA, EMA, RSI, MACD, BB, ATR, ADX, Stoch)     │
 │   • Chỉ số Tài chính (ROE TTM 4 quý, P/E, P/B, Debt/Equity)             │
 │   • Order Block Detection (Vùng gom Bullish OB, Vùng cản Bearish OB)    │
@@ -88,16 +89,16 @@ Hệ thống quản lý nghiêm ngặt 3 trạng thái xuyên suốt toàn bộ 
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                     ĐỘNG CƠ TÍN HIỆU (SIGNAL ENGINE)                    │
 │  [signals/signal_engine.py & strategies.py]                             │
-│   • Chiến lược đa tầng: Quality Trend v1 (Trend + Momentum + Foreign)    │
-│   • Sinh tín hiệu chuẩn: BUY / SELL / HOLD / NO SIGNAL kèm confidence  │
+│   • Chiến lược đa tầng: Quality Trend v1 (Trend + Momentum + Foreign)   |
+│   • Sinh tín hiệu chuẩn: BUY / SELL / HOLD / NO SIGNAL kèm confidence   │
 └────────────────────────────────────┬────────────────────────────────────┘
                                      │
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                    CỔNG QUẢN TRỊ RỦI RO (RISK GATE)                     │
 │  [signals/risk_manager.py]                                              │
-│   • Bắt buộc Stop-Loss & Take-Profit • Yêu cầu Reward/Risk >= 2.0        │
-│   • Kiểm tra hạn mức lỗ ngày (Daily Loss) & Sụt giảm tài khoản (Drawdown)│
+│   • Bắt buộc Stop-Loss & Take-Profit • Yêu cầu Reward/Risk >= 2.0       │
+│   • Kiểm tra hạn mức lỗ ngày (Daily Loss) & Sụt giảm tài khoản(Drawdown)│
 │   • Kiểm tra thanh khoản 20 phiên & Giới hạn khối lượng lệnh            │
 │   • Cooldown chống sinh tín hiệu trùng lặp liên tiếp                    │
 │   • Quyết định: ALLOW / BLOCK kèm lý do minh bạch                       │
