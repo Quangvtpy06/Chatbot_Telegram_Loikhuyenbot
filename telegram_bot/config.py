@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ENV_PATH = PROJECT_ROOT / ".env"
+# Tên doanh nghiệp bị nhập nhầm thành mã cổ phiếu trên sàn.
+INVALID_EQUITY_SYMBOLS = frozenset({"VNPT"})
 
 
 def _project_path(value: str | Path) -> Path:
@@ -56,7 +58,7 @@ def _parse_symbols(raw_value: str) -> tuple[str, ...]:
     invalid = [symbol for symbol in symbols if not re.fullmatch(r"[A-Z][A-Z0-9]{1,9}", symbol)]
     if invalid:
         raise ValueError(f"TELEGRAM_REALTIME_SYMBOLS có mã không hợp lệ: {invalid}")
-    return tuple(dict.fromkeys(symbols))
+    return tuple(symbol for symbol in dict.fromkeys(symbols) if symbol not in INVALID_EQUITY_SYMBOLS)
 
 
 @dataclass(frozen=True)

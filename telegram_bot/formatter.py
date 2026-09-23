@@ -232,11 +232,11 @@ def format_check(
     if price_parts:
         lines.append(f"💵 <b>Giá hiện tại:</b> {' '.join(price_parts)}")
 
-    vol = volume or metrics.get("volume") or metrics.get("latest_volume")
-    if not vol and metrics.get("total_volume"):
-        raw_tv = float(metrics["total_volume"])
-        vol = raw_tv * 10.0 if raw_tv < 50_000_000 else raw_tv
-    if vol:
+    # Các giá trị từ SignalView đã là số cổ phiếu, kể cả nhánh dự phòng.
+    vol = next((value for value in (
+        volume, metrics.get("volume"), metrics.get("latest_volume"), metrics.get("total_volume")
+    ) if value is not None), None)
+    if vol is not None:
         lines.append(f"📦 <b>Khối lượng:</b> <code>{vol:,.0f} cp</code>")
 
     tech_lines = []

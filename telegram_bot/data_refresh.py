@@ -7,6 +7,7 @@ import json
 import logging
 import sqlite3
 import time
+from contextlib import closing
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -29,7 +30,7 @@ except ImportError:
         save_latest_realtime_rows,
     )
 
-from .config import BotConfig
+from .config import BotConfig, INVALID_EQUITY_SYMBOLS
 from .subscriber_repository import SubscriberRepository
 
 if TYPE_CHECKING:
@@ -225,8 +226,10 @@ class RealtimeRefreshService:
     def _symbols(self) -> tuple[str, ...]:
         configured = set(self.config.realtime_symbols)
         configured.update(self.subscribers.list_all_watchlist_symbols())
+        configured.difference_update(INVALID_EQUITY_SYMBOLS)
         if not configured:
             configured.update(self._snapshot_symbols())
+            configured.difference_update(INVALID_EQUITY_SYMBOLS)
         symbols = tuple(sorted(configured))
         if len(symbols) > self.config.realtime_max_symbols:
             return symbols[: self.config.realtime_max_symbols]
@@ -238,11 +241,11 @@ class RealtimeRefreshService:
         if not self.config.analytics_database.is_file():
             return ()
         try:
-            with sqlite3.connect(
+            with closing(sqlite3.connect(
                     f"file:{self.config.analytics_database.as_posix()}?mode=ro",
                     uri=True,
                     timeout=5,
-            ) as connection:
+            )) as connection:
                 rows = connection.execute(
                     "SELECT UPPER(symbol) FROM stock_snapshot ORDER BY symbol"
                 ).fetchall()

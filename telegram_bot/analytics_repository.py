@@ -21,6 +21,7 @@ except ImportError:  # Hỗ trợ chạy ``python -m dnse.telegram_bot`` từ th
     from dnse.storage.repositories import PositionRepository
 
 from .models import SignalView, SystemStatus
+from .config import INVALID_EQUITY_SYMBOLS
 
 LOGGER = logging.getLogger(__name__)
 
@@ -279,15 +280,12 @@ class AnalyticsRepository:
         metrics["price_change"] = p_change
         metrics["price_change_pct"] = p_change_pct
 
-        # Chuẩn hóa khối lượng:
-        # Nếu có latest_volume từ lịch sử nến ngày (đã là số cp chuẩn), ưu tiên sử dụng.
-        # Nếu dùng total_volume từ DNSE realtime OpenAPI (vốn gửi theo lô 10 cp), nhân 10 để ra số lượng cp thực tế.
+        # Cả hai cột đã có đơn vị cổ phiếu trong pipeline; không quy đổi lần nữa.
         raw_vol = values.get("latest_volume")
         tot_v = values.get("total_volume")
         if tot_v is not None and tot_v > 0:
-            norm_tot_v = float(tot_v) * 10.0 if float(tot_v) < 50_000_000 else float(tot_v)
-            if raw_vol is None or norm_tot_v >= raw_vol:
-                raw_vol = norm_tot_v
+            if raw_vol is None or tot_v >= raw_vol:
+                raw_vol = float(tot_v)
         metrics["volume"] = raw_vol
 
         display_price = event.reference_price or values.get("realtime_price") or values.get("latest_close")
@@ -319,7 +317,10 @@ class AnalyticsRepository:
                 rows = connection.execute(
                     "SELECT DISTINCT symbol FROM stock_snapshot ORDER BY symbol"
                 ).fetchall()
-                return [str(r[0]) for r in rows if r[0]]
+                return [
+                    str(r[0]) for r in rows
+                    if r[0] and str(r[0]).strip().upper() not in INVALID_EQUITY_SYMBOLS
+                ]
         except Exception:
             return []
 

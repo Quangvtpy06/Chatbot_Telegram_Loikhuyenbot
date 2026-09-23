@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Iterator
 
+from .config import INVALID_EQUITY_SYMBOLS
+
 try:
     from storage.migrations import migrate_database
 except ImportError:
@@ -22,6 +24,12 @@ class SubscriberRepository:
         self.watchlist_limit = watchlist_limit
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         migrate_database(self.database_path)
+        # Dọn mã nhập nhầm đã lưu từ các phiên bản trước.
+        with self._connection() as connection:
+            connection.executemany(
+                "DELETE FROM watchlists WHERE UPPER(TRIM(symbol)) = ?",
+                [(symbol,) for symbol in INVALID_EQUITY_SYMBOLS],
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=10)
@@ -141,6 +149,9 @@ class SubscriberRepository:
     def add_to_watchlist(self, chat_id: int, symbol: str) -> bool:
         """Thêm mã; trả False nếu mã đã có trong danh sách."""
 
+        symbol = symbol.strip().upper()
+        if symbol in INVALID_EQUITY_SYMBOLS:
+            raise ValueError(f"{symbol} không phải mã cổ phiếu niêm yết/đăng ký giao dịch.")
         with self._connection() as connection:
             count = int(
                 connection.execute(
@@ -314,4 +325,3 @@ class SubscriberRepository:
                 """,
                 (inv_mode, now, chat_id),
             )
-

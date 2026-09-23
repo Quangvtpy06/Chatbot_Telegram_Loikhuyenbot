@@ -46,7 +46,7 @@ from zoneinfo import ZoneInfo
 VIETNAM_TIMEZONE = ZoneInfo("Asia/Ho_Chi_Minh")
 
 from .analytics_repository import AnalyticsRepository
-from .config import BotConfig
+from .config import BotConfig, INVALID_EQUITY_SYMBOLS
 from .formatter import (
     format_access_denied,
     format_block,
@@ -231,6 +231,8 @@ class BotHandlers:
         if not args:
             return None
         symbol = args[0].strip().upper()
+        if symbol in INVALID_EQUITY_SYMBOLS:
+            return None
         return symbol if SYMBOL_PATTERN.fullmatch(symbol) else None
 
     def _save_user(self, update: Update) -> None:
