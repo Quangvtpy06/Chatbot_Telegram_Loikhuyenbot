@@ -26,9 +26,9 @@ from pathlib import Path
 from typing import Optional
 
 try:
-    from signals.models import SignalEvent
+    from signals.models_signal import SignalEvent
 except ImportError:
-    from .models import SignalEvent
+    from .models_signal import SignalEvent
 
 try:
     from storage.repositories import (

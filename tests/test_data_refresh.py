@@ -29,6 +29,7 @@ def _service() -> RealtimeRefreshService:
 
 
 def test_dung_stock_snapshot_khi_chua_co_cau_hinh_hoac_watchlist(monkeypatch) -> None:
+    monkeypatch.setattr("telegram_bot.data_refresh.equity_symbols", lambda: frozenset({"FPT", "HPG"}))
     service = _service()
     monkeypatch.setattr(service, "_snapshot_symbols", lambda: ("FPT", "HPG"))
 

@@ -13,6 +13,7 @@ from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
 try:
+    from collectors_processing.symbol_registry import equity_symbols, require_equity
     from signals.risk_manager import RiskGate
     from storage.repositories import PositionRepository, RiskDecision
     from collectors_processing.dnse_api_crawl import (
@@ -26,6 +27,7 @@ try:
     )
     from collectors_processing.analytics import AnalyticsPipeline, PipelineConfig
 except ImportError:
+    from dnse.collectors_processing.symbol_registry import equity_symbols, require_equity
     from dnse.signals.risk_manager import RiskGate
     from dnse.storage.repositories import PositionRepository, RiskDecision
     from dnse.collectors_processing.dnse_api_crawl import (
@@ -76,10 +78,13 @@ def _fetch_symbol_data(symbol: str, config: BotConfig) -> None:
     - BCTC vnstock: chỉ fetch lần đầu, lưu cache, lần sau dùng lại.
     """
 
+    require_equity(symbol)
     client = DNSEClient(DNSEConfig())
     try:
         # 1. Realtime snapshot — luôn lấy mới
         rows = client.fetch_realtime([symbol])
+        if not rows or not any(row.get("close") is not None for row in rows):
+            raise RuntimeError(f"DNSE chưa trả dữ liệu giao dịch thật cho {symbol}")
         if rows:
             save_latest_realtime_rows(
                 rows, config.data_dir / "realtime" / "trades_latest.jsonl"
@@ -109,6 +114,7 @@ def _fetch_symbol_data(symbol: str, config: BotConfig) -> None:
             crawl_market_indices(client, ["VNINDEX", "VN30"], start_date, end_date, "1D", config.data_dir)
     except Exception as exc:
         LOGGER.error("Lỗi khi thu thập dữ liệu DNSE on-demand cho %s: %s", symbol, exc)
+        raise
     finally:
         client.close()
 
@@ -152,33 +158,38 @@ def _run_analytics(symbol: str, config: BotConfig) -> None:
             output_dir=config.analytics_output_dir,
             database_path=config.analytics_database,
             expected_symbols=[symbol],
+            allowed_symbols=equity_symbols(),
         )
     )
     pipeline.run()
 
 
-def _fetch_index_data_from_vnstock(symbol: str) -> dict[str, Any]:
-    """Lấy dữ liệu chỉ số thị trường (VNINDEX, VN30) bao gồm tổng khối lượng chuẩn từ VCI/vnstock."""
-    import contextlib
-    import os
+def _fetch_index_data_realtime(symbol: str) -> dict:
+    """Lấy snapshot mới nhất từ DNSE, kể cả phiên gần nhất vào ngày nghỉ."""
+    client = DNSEClient(DNSEConfig())
     try:
-        with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-            from vnstock.api.quote import Quote
-            end_date = datetime.now(VIETNAM_TIMEZONE).strftime("%Y-%m-%d")
-            start_date = (datetime.now(VIETNAM_TIMEZONE) - timedelta(days=7)).strftime("%Y-%m-%d")
-            q = Quote(symbol=symbol, source="VCI", show_log=False)
-            df = q.history(start=start_date, end=end_date)
-            if df is not None and len(df) >= 2:
-                last_row = df.iloc[-1]
-                prev_row = df.iloc[-2]
+        now = datetime.now(VIETNAM_TIMEZONE)
+        for offset in range(10):
+            start = (now - timedelta(days=offset)).replace(hour=0, minute=0, second=0, microsecond=0)
+            end = min(now, start + timedelta(days=1) - timedelta(seconds=1))
+            payload = client.request(
+                "GET", f"/price/{symbol}/market-index",
+                params={"from": int(start.timestamp()), "to": int(end.timestamp()), "limit": 1},
+            )
+            rows = payload.get("marketIndices", [])
+            if rows:
+                row = rows[0]
                 return {
-                    "c": float(last_row["close"]),
-                    "prev_c": float(prev_row["close"]),
-                    "v": int(last_row["volume"]),
-                    "symbol": symbol,
+                    "c": row.get("valueIndexes"),
+                    "prev_c": row.get("priorValueIndexes"),
+                    "v": row.get("totalVolumeTraded"),
+                    "value_billion": row.get("grossTradeAmount"),
+                    "as_of": row.get("transactionTime"),
                 }
-    except Exception as exc:
-        LOGGER.warning("Không thể lấy dữ liệu index %s từ vnstock: %s", symbol, exc)
+    except Exception:
+        LOGGER.exception("Không lấy được snapshot chỉ số %s", symbol)
+    finally:
+        client.close()
     return {}
 
 
@@ -245,6 +256,23 @@ class BotHandlers:
             username=user.username if user else None,
             first_name=user.first_name if user else None,
         )
+
+    async def _validated_symbol(self, update: Update, args: list[str]) -> str | None:
+        """Xác thực mã qua DNSE trước cả việc đọc cache hoặc thêm watchlist."""
+        if not args:
+            await self._reply(update, "Vui lòng nhập mã cổ phiếu, ví dụ: <code>FPT</code>.")
+            return None
+        symbol = args[0].strip().upper()
+        try:
+            valid = await asyncio.to_thread(equity_symbols)
+        except Exception:
+            LOGGER.exception("Không xác thực được danh mục DNSE")
+            await self._reply(update, "⚠️ Chưa xác thực được danh mục DNSE. Vui lòng thử lại sau; bot chưa đồng bộ mã này.")
+            return None
+        if symbol not in valid:
+            await self._reply(update, f"❌ Không tồn tại mã cổ phiếu <b>{_escape_error(symbol)}</b> trong danh mục DNSE.")
+            return None
+        return symbol
 
     async def _on_demand_fetch_and_analyze(
             self, update: Update, symbol: str, user_settings: dict | None = None
@@ -333,7 +361,9 @@ class BotHandlers:
                     "Giá nhập bằng đồng, khối lượng bằng cổ phiếu.",
                 )
                 return
-            symbol = self._symbol(args[1:2])
+            symbol = await self._validated_symbol(update, args[1:2])
+            if symbol is None:
+                return
             try:
                 price_vnd = float(args[2].replace(",", ""))
                 quantity = float(args[3].replace(",", ""))
@@ -483,12 +513,6 @@ class BotHandlers:
                     callback_data="set_inv:LONG_TERM",
                 )
             ],
-            [
-                InlineKeyboardButton(
-                    "🔄 3. Cả hai (Đa khung thời gian)" + (" ✅" if current_mode == "BOTH" else ""),
-                    callback_data="set_inv:BOTH",
-                )
-            ],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         if update.effective_message:
@@ -511,6 +535,9 @@ class BotHandlers:
             return
 
         mode = data.split(":", 1)[1].strip().upper()
+        if mode not in {"SHORT_TERM", "LONG_TERM"}:
+            await query.answer("Lựa chọn này đã bị bỏ. Dùng /setup để chọn Ngắn hạn hoặc Dài hạn.", show_alert=True)
+            return
         chat_id = update.effective_chat.id if update.effective_chat else 0
 
         self.subscribers.set_investment_mode(chat_id, mode)
@@ -519,8 +546,6 @@ class BotHandlers:
             "Ngắn hạn (Kỹ thuật / Lướt sóng)"
             if mode == "SHORT_TERM"
             else "Dài hạn (Cơ bản / Tích sản)"
-            if mode == "LONG_TERM"
-            else "Cả hai (Đa khung thời gian)"
         )
         await query.answer(f"✅ Đã chọn: {mode_name}!")
 
@@ -535,12 +560,6 @@ class BotHandlers:
                 InlineKeyboardButton(
                     "🏛 2. Dài hạn (Cơ bản / Tích sản)" + (" ✅" if mode == "LONG_TERM" else ""),
                     callback_data="set_inv:LONG_TERM",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🔄 3. Cả hai (Đa khung thời gian)" + (" ✅" if mode == "BOTH" else ""),
-                    callback_data="set_inv:BOTH",
                 )
             ],
         ]
@@ -578,7 +597,12 @@ class BotHandlers:
                 )
                 return
 
-            scan_symbols = user_watchlist
+            try:
+                valid = await asyncio.to_thread(equity_symbols)
+            except Exception:
+                await self._reply(update, "⚠️ Chưa xác thực được danh mục DNSE. Vui lòng thử lại sau.")
+                return
+            scan_symbols = [symbol for symbol in user_watchlist if symbol in valid]
             source_label = "Watchlist cá nhân của bạn"
             await self._reply(
                 update,
@@ -604,6 +628,12 @@ class BotHandlers:
         if raw_arg in ("ALL", "MARKET", "THITRUONG"):
             snapshot_syms = self.analytics.list_snapshot_symbols()
             scan_symbols = snapshot_syms if snapshot_syms else ["FPT", "HPG", "VNM", "MWG", "VCB", "SSI"]
+            try:
+                valid = await asyncio.to_thread(equity_symbols)
+            except Exception:
+                await self._reply(update, "⚠️ Chưa xác thực được danh mục DNSE. Vui lòng thử lại sau.")
+                return
+            scan_symbols = [symbol for symbol in scan_symbols if symbol in valid]
             source_label = "Toàn bộ thị trường / Danh mục hệ thống"
 
             await self._reply(
@@ -627,21 +657,15 @@ class BotHandlers:
             return
 
         # TRƯỜNG HỢP 3: /signal [MÃ] -> Báo động tín hiệu cho 1 mã cụ thể
-        symbol = self._symbol(context.args)
+        symbol = await self._validated_symbol(update, context.args)
         if symbol is None:
-            await self._reply(
-                update,
-                "📈 <b>Cú pháp lệnh /signal:</b>\n"
-                "• <code>/signal</code> — Quét bộ lọc Mua/Bán trên <b>Watchlist cá nhân</b>\n"
-                "• <code>/signal all</code> — Quét bộ lọc trên <b>Toàn bộ thị trường</b>\n"
-                "• <code>/signal [MÃ]</code> — Xem tín hiệu, vùng mua, SL &amp; TP của <b>1 mã cụ thể</b> (Ví dụ: <code>/signal FPT</code>)",
-            )
             return
 
         signal_view, signal_event = self.analytics.get_signal_view(
             symbol, user_settings=user_settings
         )
-        if signal_view.price is None or signal_view.data_status == "MISSING":
+        if (signal_view.price is None or signal_view.data_status == "MISSING"
+                or signal_view.metadata.get("missing_fundamental_fields")):
             try:
                 signal_view, signal_event = await self._on_demand_fetch_and_analyze(
                     update, symbol, user_settings=user_settings
@@ -659,19 +683,13 @@ class BotHandlers:
         """Tra cứu On-demand một mã cổ phiếu cụ thể (/check [MÃ]).
 
         Trả về: Giá hiện tại, tăng/giảm, khối lượng, trạng thái các chỉ báo (RSI, MACD, MA)
-        kèm đồ thị kỹ thuật nhanh.
+        Biểu đồ được xuất riêng bằng lệnh /chart.
         """
         if not await self._authorize(update, "check"):
             return
         self._save_user(update)
-        symbol = self._symbol(context.args)
+        symbol = await self._validated_symbol(update, context.args)
         if symbol is None:
-            await self._reply(
-                update,
-                "🔎 <b>Cú pháp tra cứu:</b> <code>/check [MÃ]</code>\n"
-                "Ví dụ: <code>/check FPT</code>\n\n"
-                "<i>Dùng để kiểm tra nhanh giá realtime, khối lượng, chỉ báo kỹ thuật (RSI, MACD, MA) và đồ thị nến của một cổ phiếu bất kỳ.</i>",
-            )
             return
 
         try:
@@ -693,26 +711,6 @@ class BotHandlers:
         )
         await self._reply(update, check_msg)
 
-        # Vẽ và gửi đồ thị kỹ thuật nhanh Bollinger Bands
-        try:
-            from .chart_service import generate_bollinger_chart
-
-            chart_path = await asyncio.to_thread(
-                generate_bollinger_chart,
-                symbol,
-                self.config.data_dir,
-            )
-            if chart_path and chart_path.is_file() and update.effective_message:
-                with open(chart_path, "rb") as photo_file:
-                    await update.effective_message.reply_photo(
-                        photo=photo_file,
-                        caption=f"📈 Đồ thị kỹ thuật Bollinger Bands — {symbol}",
-                    )
-        except Exception:
-            LOGGER.exception("Lỗi khi vẽ đồ thị nhanh cho %s", symbol)
-
-        asyncio.create_task(_cleanup_symbol_data(symbol, self.config))
-
     async def market(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Kiểm tra dữ liệu thị trường VNINDEX, VN30."""
         if not await self._authorize(update, "market"):
@@ -725,38 +723,10 @@ class BotHandlers:
         )
 
         try:
-            # 1. Ưu tiên lấy từ vnstock để có tổng khối lượng chuẩn khớp 100% với bảng điện (khớp lệnh + thỏa thuận)
-            vnindex_data = await asyncio.to_thread(_fetch_index_data_from_vnstock, "VNINDEX")
-            vn30_data = await asyncio.to_thread(_fetch_index_data_from_vnstock, "VN30")
-
-            # 2. Fallback sang DNSE client nếu vnstock thiếu dữ liệu
-            if not vnindex_data or not vn30_data:
-                client = DNSEClient(DNSEConfig())
-                try:
-                    end_date = datetime.now(VIETNAM_TIMEZONE).strftime("%Y-%m-%d")
-                    start_date = (datetime.now(VIETNAM_TIMEZONE) - timedelta(days=7)).strftime("%Y-%m-%d")
-
-                    if not vnindex_data:
-                        vnindex_history = await asyncio.to_thread(
-                            client.fetch_history, "VNINDEX", start_date, end_date, "1D", "INDEX"
-                        )
-                        if len(vnindex_history) >= 2:
-                            vnindex_data = dict(vnindex_history[-1])
-                            vnindex_data["prev_c"] = vnindex_history[-2].get("c")
-                        else:
-                            vnindex_data = dict(vnindex_history[-1]) if vnindex_history else {}
-
-                    if not vn30_data:
-                        vn30_history = await asyncio.to_thread(
-                            client.fetch_history, "VN30", start_date, end_date, "1D", "INDEX"
-                        )
-                        if len(vn30_history) >= 2:
-                            vn30_data = dict(vn30_history[-1])
-                            vn30_data["prev_c"] = vn30_history[-2].get("c")
-                        else:
-                            vn30_data = dict(vn30_history[-1]) if vn30_history else {}
-                finally:
-                    client.close()
+            vnindex_data, vn30_data = await asyncio.gather(
+                asyncio.to_thread(_fetch_index_data_realtime, "VNINDEX"),
+                asyncio.to_thread(_fetch_index_data_realtime, "VN30"),
+            )
 
             await self._reply(update, format_market(vnindex_data, vn30_data))
         except Exception as exc:
@@ -769,9 +739,8 @@ class BotHandlers:
         if not await self._authorize(update, "chart"):
             return
         self._save_user(update)
-        symbol = self._symbol(context.args)
+        symbol = await self._validated_symbol(update, context.args)
         if symbol is None:
-            await self._reply(update, "Cú pháp: <code>/chart FPT</code>")
             return
 
         # Kiểm tra có data lịch sử chưa, nếu chưa thì fetch on-demand
@@ -818,14 +787,8 @@ class BotHandlers:
         if not await self._authorize(update, "block"):
             return
         self._save_user(update)
-        symbol = self._symbol(context.args)
+        symbol = await self._validated_symbol(update, context.args)
         if symbol is None:
-            await self._reply(
-                update,
-                "🧱 <b>Cú pháp tra cứu:</b> <code>/block [MÃ]</code>\n"
-                "Ví dụ: <code>/block FPT</code>\n\n"
-                "<i>Bắt đỉnh đáy ngắn hạn với Stochastic Oscillator (14, 3, 3), nhận diện vùng Order Block (Bullish/Bearish) và các mốc Kháng cự / Hỗ trợ chủ chốt.</i>",
-            )
             return
 
         # Kiểm tra file lịch sử, nếu chưa có thì fetch on-demand
@@ -881,9 +844,8 @@ class BotHandlers:
         if not await self._authorize(update, "watch"):
             return
         self._save_user(update)
-        symbol = self._symbol(context.args)
+        symbol = await self._validated_symbol(update, context.args)
         if symbol is None:
-            await self._reply(update, "Cú pháp: <code>/watch FPT</code>")
             return
         try:
             added = self.subscribers.add_to_watchlist(update.effective_chat.id, symbol)
@@ -926,7 +888,7 @@ class BotHandlers:
                 count = self.subscribers.clear_watchlist(update.effective_chat.id)
                 await self._reply(update, f"✅ Đã xóa {count} mã khỏi watchlist.")
                 return
-            symbol = self._symbol(args[1:])
+            symbol = args[1].strip().upper() if len(args) > 1 else None
             if symbol is None:
                 await self._reply(
                     update,
@@ -935,6 +897,9 @@ class BotHandlers:
                 )
                 return
             if action == "add":
+                symbol = await self._validated_symbol(update, args[1:])
+                if symbol is None:
+                    return
                 try:
                     added = self.subscribers.add_to_watchlist(
                         update.effective_chat.id, symbol

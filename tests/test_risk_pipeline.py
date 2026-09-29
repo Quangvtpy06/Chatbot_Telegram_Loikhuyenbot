@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from notifications.service import NotificationService
-from signals.models import SignalEvent
+from signals.models_signal import SignalEvent
 from signals.risk_manager import RiskConfig, create_risk_gate
 from signals.signal_engine import create_signal_engine
 from storage.repositories import (

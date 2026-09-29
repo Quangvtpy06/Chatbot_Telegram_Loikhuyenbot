@@ -23,6 +23,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+try:
+    from .fundamental_schema import normalize_fundamental_fields
+except ImportError:
+    from fundamental_schema import normalize_fundamental_fields
+
 LOGGER = logging.getLogger("dnse.analytics")
 LOCAL_TIMEZONE = "Asia/Ho_Chi_Minh"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -132,6 +137,7 @@ class PipelineConfig:
     database_path: Path
     fail_on_quality_errors: bool = False
     expected_symbols: tuple[str, ...] = ()
+    allowed_symbols: frozenset[str] | None = None
     max_price_age_days: float = 7.0
     max_realtime_age_minutes: float = 1_440.0
     max_quarter_age_days: int = 200
@@ -224,6 +230,9 @@ class AnalyticsPipeline:
         self._load_crawl_status()
 
         for name, frame in self.raw.items():
+            if self.config.allowed_symbols is not None and name != "market_history" and "symbol" in frame:
+                frame = frame[frame["symbol"].astype(str).str.upper().isin(self.config.allowed_symbols)].copy()
+                self.raw[name] = frame
             self.stats[name] = {
                 "input_rows": int(len(frame)),
                 "input_files": int(frame["_source_file"].nunique())
@@ -583,7 +592,7 @@ class AnalyticsPipeline:
                 columns=["symbol", "period_type", "period", "source", *FUNDAMENTAL_NUMERIC_COLUMNS]
             )
 
-        data = frame.copy()
+        data = normalize_fundamental_fields(frame)
         if "period" not in data.columns and "report_period" in data.columns:
             data["period"] = data["report_period"]
         if "net_sales" not in data.columns and "revenue" in data.columns:
@@ -796,9 +805,10 @@ class AnalyticsPipeline:
             return
 
         data = pd.concat(frames, ignore_index=True, sort=False)
-        data = data.sort_values("_dataset_priority").drop_duplicates(
-            ["symbol", "period_type", "period", "source"], keep="first"
-        )
+        # Cùng nguồn/cùng kỳ: screening có thể thiếu ô mà báo cáo gốc đã có.
+        data = data.sort_values("_dataset_priority").groupby(
+            ["symbol", "period_type", "period", "source"], as_index=False, sort=False
+        ).first()
         selected_rows: list[dict[str, Any]] = []
         audit_rows: list[dict[str, Any]] = []
 
@@ -1335,7 +1345,9 @@ class AnalyticsPipeline:
     def analyze(self) -> None:
         """Tính chỉ báo giá, ghép dữ liệu cơ bản và chấm điểm sàng lọc."""
 
-        price = self._analyze_price_history(self.cleaned["history"])
+        price = self._analyze_price_history(self._history_with_realtime(
+            self.cleaned["history"], self.cleaned["realtime"]
+        ))
         market_metrics = self._analyze_price_history(self.cleaned["market_history"])
         market_context = market_metrics.rename(
             columns={"price_as_of": "as_of", "latest_close": "close"}
@@ -1347,6 +1359,12 @@ class AnalyticsPipeline:
             self.cleaned["realtime"],
             self.cleaned["foreign_flow"],
         )
+        reference_path = self.config.input_dir / "reference" / "industries.csv"
+        if reference_path.is_file():
+            reference = pd.read_csv(reference_path, dtype={"symbol": str})
+            if {"symbol", "sector"}.issubset(reference.columns):
+                reference = reference.drop_duplicates("symbol", keep="last")
+                snapshot = snapshot.merge(reference[["symbol", "sector"]], on="symbol", how="left", validate="one_to_one")
         data_quality = self.analysis.get("data_quality", pd.DataFrame())
         if not data_quality.empty:
             snapshot = snapshot.merge(data_quality, on="symbol", how="outer", validate="one_to_one")
@@ -1355,6 +1373,38 @@ class AnalyticsPipeline:
         self.analysis["market_context"] = market_context
         self.analysis["stock_snapshot"] = snapshot
         self.analysis["screening_ranked"] = ranked
+
+    @staticmethod
+    def _history_with_realtime(history: pd.DataFrame, realtime: pd.DataFrame) -> pd.DataFrame:
+        """Ghép nến ngày tạm vào bản sao; không ghi đè lịch sử nến đã lưu."""
+        if history.empty or realtime.empty:
+            return history.copy()
+        now = pd.Timestamp.now(tz=LOCAL_TIMEZONE)
+        latest = realtime.sort_values("timestamp_local").drop_duplicates("symbol", keep="last").copy()
+        latest = latest[
+            latest["timestamp_local"].dt.date.eq(now.date())
+            & latest["timestamp_local"].le(now)
+            & latest["match_price"].gt(0)
+            & latest["total_volume"].ge(0)
+        ].copy()
+        if latest.empty:
+            return history.copy()
+        latest["date"] = latest["timestamp_local"].dt.strftime("%Y-%m-%d")
+        latest["timestamp_utc"] = latest["timestamp_local"].dt.tz_convert("UTC")
+        latest["close"] = latest["match_price"]
+        latest["volume"] = latest["total_volume"]
+        latest["interval"] = "1D"
+        for column in ("open", "high", "low"):
+            latest[column] = latest[column].where(latest[column].gt(0), latest["close"])
+        latest["high"] = latest[["high", "close", "open"]].max(axis=1)
+        latest["low"] = latest[["low", "close", "open"]].min(axis=1)
+        # Chỉ áp dụng cho mã đã có lịch sử; không tạo chỉ báo từ một tick riêng lẻ.
+        newest = history.groupby("symbol")["date"].max()
+        latest = latest[latest["symbol"].isin(newest.index)]
+        latest = latest[latest["date"].ge(latest["symbol"].map(newest))]
+        return pd.concat([history, latest.reindex(columns=history.columns)], ignore_index=True).drop_duplicates(
+            ["symbol", "date"], keep="last"
+        ).sort_values(["symbol", "timestamp_utc"])
 
     @staticmethod
     def _analyze_price_history(history: pd.DataFrame) -> pd.DataFrame:

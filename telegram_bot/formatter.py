@@ -28,7 +28,7 @@ def format_start(first_name: str | None, chat_id: int) -> str:
         "1️⃣ Gõ <code>/check [MÃ]</code> (Ví dụ: <code>/check FPT</code>) để bot nạp giá realtime mới nhất từ DNSE &amp; làm mới toàn bộ chỉ báo.\n"
         "2️⃣ Gõ <code>/signal [MÃ]</code> (Ví dụ: <code>/signal FPT</code>) để xem khuyến nghị Mua/Bán, các lý do chiến lược và mốc SL/TP.\n\n"
         "🔎 <b>Tra cứu &amp; Cập nhật Realtime:</b>\n"
-        "• <code>/check [MÃ]</code> — Kéo giá realtime, chỉ báo (RSI, MACD, MA) + Đồ thị nến\n"
+        "• <code>/check [MÃ]</code> — Giá realtime và chỉ báo (RSI, MACD, MA); biểu đồ riêng qua /chart\n"
         "• <code>/block [MÃ]</code> — Bắt đỉnh/đáy ngắn hạn (Stochastic &amp; Order Block)\n"
         "• <code>/chart [MÃ]</code> — Biểu đồ kỹ thuật Bollinger Bands\n\n"
         "📈 <b>Bộ lọc &amp; Báo động:</b>\n"
@@ -39,7 +39,7 @@ def format_start(first_name: str | None, chat_id: int) -> str:
         "• <code>/watch [MÃ]</code> — Thêm mã vào Watchlist để nhận thông báo tự động khi nổ sóng\n"
         "• <code>/unwatch [MÃ]</code> — Xóa mã khỏi Watchlist\n"
         "• <code>/watchlist</code> — Xem danh sách các mã đang theo dõi\n"
-        "• <code>/setup</code> — Cài đặt khẩu vị đầu tư (Ngắn hạn kỹ thuật / Dài hạn cơ bản / Cả hai)\n"
+        "• <code>/setup</code> — Cài đặt khẩu vị đầu tư (Ngắn hạn kỹ thuật / Dài hạn cơ bản)\n"
         "• <code>/settings</code> — Cài đặt quản trị rủi ro SL/TP (Cố định F0 hoặc Cấu trúc nến Pro)\n"
         "• <code>/market</code> — Xem dữ liệu VNINDEX, VN30\n"
         "• <code>/help</code> — Cẩm nang hướng dẫn sử dụng chi tiết\n\n"
@@ -57,7 +57,6 @@ def format_help() -> str:
         "• <code>/setup</code> — Chọn khẩu vị đầu tư cá nhân:\n"
         "  - ⚡️ <i>Ngắn hạn:</i> Lọc theo kỹ thuật (MA, RSI, MACD, Volume bùng nổ, Khối ngoại).\n"
         "  - 🏛 <i>Dài hạn:</i> Lọc theo định giá cơ bản (P/E, P/B, ROE, D/E, BCTC quý mới nhất).\n"
-        "  - 🔄 <i>Cả hai:</i> Đa khung thời gian (Định giá tốt + Điểm vào kỹ thuật tối ưu).\n"
         "• <code>/settings</code> — Cài đặt cơ chế Cắt lỗ (SL) &amp; Chốt lời (TP):\n"
         "  - 🛡 <i>Cố định An toàn (F0):</i> Cắt lỗ -5%, Chốt lời +10% (Tỷ lệ R:R = 2.0 chuẩn mực).\n"
         "  - 🎯 <i>Cấu trúc Nến (Pro):</i> Cắt lỗ theo đáy Order Block, Chốt lời theo đỉnh cản &amp; BB.\n\n"
@@ -68,7 +67,7 @@ def format_help() -> str:
         "• <code>/check [MÃ]</code> (Ví dụ: <code>/check FPT</code>):\n"
         "  - Kích hoạt bot <b>kết nối trực tiếp sàn DNSE</b> để nạp giá realtime mới nhất từng giây.\n"
         "  - Quét giao dịch Khối ngoại 5 phiên, đồng bộ BCTC và làm mới toàn bộ chỉ báo kỹ thuật.\n"
-        "  - Trả về: Giá realtime, biến động %, RSI, MACD, MA, P/E, ROE kèm ảnh đồ thị nến.\n"
+        "  - Trả về: Giá realtime, biến động %, RSI, MACD, MA, P/E, ROE. Xem biểu đồ bằng /chart.\n"
         "• <code>/block [MÃ]</code> — Soi vùng gom hàng (Bullish OB), vùng cản (Bearish OB) &amp; đỉnh/đáy Stochastic.\n"
         "• <code>/chart [MÃ]</code> — Biểu đồ nến dải Bollinger Bands trực quan chi tiết.\n\n"
         "3️⃣ <b>BƯỚC 3: QUÉT TÍN HIỆU, ĐIỂM VÀO/RA &amp; NHẬN BÁO ĐỘNG</b>\n"
@@ -164,13 +163,17 @@ def format_system_status(
 
 def format_market(vnindex_data: dict, vn30_data: dict) -> str:
     def _format_index(name: str, data: dict) -> str:
-        if not data:
+        if not data or data.get("c") is None:
             return f"<b>{name}:</b> Không có dữ liệu"
 
         c = data.get("c", 0.0)
         # Ưu tiên so sánh với giá tham chiếu phiên trước (prev_c) thay vì giá mở cửa (o)
         ref = data.get("prev_c") or data.get("o", 0.0)
-        v = data.get("v", 0.0)
+        v = data.get("v")
+        value = data.get("value_billion")
+        volume_text = f"{v:,.0f} cp" if v is not None else "Chưa có dữ liệu"
+        value_text = f"{value:,.2f} tỷ đồng" if value is not None else "Chưa có dữ liệu"
+        as_of = html.escape(str(data.get("as_of") or "Chưa rõ"))
         diff = c - ref
         pct = (diff / ref * 100) if ref > 0 else 0
 
@@ -180,7 +183,9 @@ def format_market(vnindex_data: dict, vn30_data: dict) -> str:
         return (
             f"{icon} <b>{name}</b>: <code>{c:,.2f}</code> "
             f"({sign}{diff:,.2f} | {sign}{pct:,.2f}%)\n"
-            f"   Khối lượng: <code>{v:,.0f} cp</code>"
+            f"   Tổng khối lượng: <code>{volume_text}</code>\n"
+            f"   Tổng giá trị giao dịch: <code>{value_text}</code>\n"
+            f"   Dữ liệu DNSE lúc: {as_of} (giờ Việt Nam)"
         )
 
     return (
@@ -234,7 +239,7 @@ def format_check(
 
     # Các giá trị từ SignalView đã là số cổ phiếu, kể cả nhánh dự phòng.
     vol = next((value for value in (
-        volume, metrics.get("volume"), metrics.get("latest_volume"), metrics.get("total_volume")
+        volume, metrics.get("volume"), metrics.get("total_volume"), metrics.get("latest_volume")
     ) if value is not None), None)
     if vol is not None:
         lines.append(f"📦 <b>Khối lượng:</b> <code>{vol:,.0f} cp</code>")
@@ -299,27 +304,35 @@ def format_check(
         lines.append("\n📊 <b>Trạng thái chỉ báo:</b>\n" + "\n".join(tech_lines))
 
     fund_lines = []
-    pe = metrics.get("pe_quarter") if metrics.get("pe_quarter") is not None else metrics.get("pe_year",
-                                                                                             metrics.get("pe"))
-    pb = metrics.get("pb_quarter") if metrics.get("pb_quarter") is not None else metrics.get("pb_year",
-                                                                                             metrics.get("pb"))
-    roe = metrics.get("roe_quarter") if metrics.get("roe_quarter") is not None else metrics.get("roe_year",
-                                                                                                metrics.get("roe"))
+    def first_metric(*keys):
+        return next((metrics[key] for key in keys if metrics.get(key) is not None), None)
+    pe = first_metric("pe_quarter", "pe_year", "pe")
+    pb = first_metric("pb_quarter", "pb_year", "pb")
+    roe = first_metric("roe_quarter", "roe_year", "roe")
     roe_ttm = metrics.get("roe_ttm")
 
     if pe is not None:
         fund_lines.append(f"P/E: <code>{pe:.1f}</code>")
+    else:
+        fund_lines.append("P/E: chưa có dữ liệu")
     if pb is not None:
         fund_lines.append(f"P/B: <code>{pb:.1f}</code>")
+    else:
+        fund_lines.append("P/B: chưa có dữ liệu")
     if roe_ttm is not None:
         fund_lines.append(f"ROE: <code>{roe_ttm * 100:.1f}%</code>")
     elif roe is not None:
         fund_lines.append(f"ROE: <code>{roe * 100:.1f}%</code>")
+    else:
+        fund_lines.append("ROE: chưa có dữ liệu")
+    sector = metrics.get("sector")
+    fund_lines.append("Ngành: " + html.escape(str(sector or "chưa có dữ liệu")))
+    debt = first_metric("debt_to_equity_quarter", "debt_to_equity_year", "debt_to_equity")
+    fund_lines.append(f"D/E: <code>{debt:.2f}</code>" if debt is not None else "D/E: chưa có dữ liệu")
 
     if fund_lines:
         lines.append(f"\n💼 <b>Chỉ số Cơ bản:</b> {' | '.join(fund_lines)}")
 
-    lines.append("\n📈 <i>Đồ thị kỹ thuật nhanh Bollinger Bands gửi kèm bên dưới:</i>")
     return "\n".join(lines)
 
 
@@ -424,8 +437,7 @@ def format_setup(current_mode: str, chat_id: int) -> str:
     """Format tin nhắn hướng dẫn chọn khẩu vị đầu tư (/setup)."""
     mode_titles = {
         "SHORT_TERM": "⚡️ <b>Ngắn hạn (Kỹ thuật / Momentum)</b>",
-        "LONG_TERM": "🏛 <b>Dài hạn (Cơ bản / Tích sản)</b>",
-        "BOTH": "🔄 <b>Cả hai (Đa khung thời gian)</b>",
+        "LONG_TERM": "🏛 <b>Dài hạn (Cơ bản / Tích sản)</b>"
     }
     mode_text = mode_titles.get(current_mode, "⚡️ <b>Ngắn hạn (Kỹ thuật)</b>")
     return (
@@ -439,9 +451,7 @@ def format_setup(current_mode: str, chat_id: int) -> str:
         "2️⃣ 🏛 <b>Chế độ Dài hạn (Cơ bản / Tích sản):</b>\n"
         "• <b>Tần suất:</b> Lọc sạch 100% tiếng ồn rung lắc nến ngày. Chỉ gửi tín hiệu khi có <b>sự kiện trọng yếu</b> (định giá P/E, P/B chiết khấu sâu hoặc quá nóng, KQKD quý mới, đột biến đòn bẩy D/E hoặc ROE).\n"
         "• <b>Quản trị rủi ro:</b> Bỏ cắt lỗ theo nến ngày, nới rộng biên an toàn (-15% / +35%) hoặc theo định giá hợp lý.\n"
-        "💡 <i>Phù hợp: Nhà đầu tư tích sản, bận rộn, coi trọng giá trị nội tại doanh nghiệp.</i>\n\n"
-        "3️⃣ 🔄 <b>Chế độ Cả hai (Đa khung thời gian):</b>\n"
-        "• Nhận song song cả 2 luồng tín hiệu (có tiền tố <code>⚡️ [NGẮN HẠN]</code> và <code>🏛 [DÀI HẠN]</code>) để vừa tối ưu điểm ra/vào ngắn hạn, vừa nắm chắc giá trị dài hạn."
+        "💡 <i>Phù hợp: Nhà đầu tư tích sản, bận rộn, coi trọng giá trị nội tại doanh nghiệp.</i>"
     )
 
 
@@ -492,15 +502,16 @@ def format_signal_single(view: SignalView, decision: Any = None) -> str:
         act_text = "QUAN SÁT THÊM (HOLD)"
     else:
         icon = "⚠️"
-        act_text = "CHƯA CÓ TÍN HIỆU (DỮ LIỆU THIẾU / ĐANG ĐỒNG BỘ)"
+        act_text = "CHƯA CÓ TÍN HIỆU — XEM LÝ DO BÊN DƯỚI"
 
     lines = [
         f"📈 <b>BÁO ĐỘNG TÍN HIỆU: {symbol}</b>",
+        "🧭 <b>Chế độ:</b> " + ("Dài hạn — Cơ bản / Tích sản" if meta.get("investment_mode") == "LONG_TERM" else "Ngắn hạn — Kỹ thuật / Lướt sóng"),
         f"🎯 <b>Hành động:</b> {icon} <b>{act_text}</b>",
     ]
 
     if action == "HOLD":
-        lines.append("📌 <i>Khuyến nghị: Đứng ngoài quan sát thêm, chờ tín hiệu xác nhận dòng tiền.</i>")
+        lines.append("📌 <i>Chưa đạt điều kiện mua dài hạn; theo dõi định giá và kết quả kinh doanh.</i>" if meta.get("investment_mode") == "LONG_TERM" else "📌 <i>Khuyến nghị: Đứng ngoài quan sát thêm, chờ tín hiệu xác nhận dòng tiền.</i>")
 
     if price > 0:
         price_label = "Vùng giá khuyến nghị" if action == "BUY" else ("Vùng giá cảnh báo" if action == "SELL" else "Giá tham chiếu hiện tại")

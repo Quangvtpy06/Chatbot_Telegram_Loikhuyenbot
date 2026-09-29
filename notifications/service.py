@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Awaitable, Protocol
 
 try:
-    from signals.models import SignalEvent
+    from signals.models_signal import SignalEvent
 except ImportError:
     from dnse.signals.models import SignalEvent
 

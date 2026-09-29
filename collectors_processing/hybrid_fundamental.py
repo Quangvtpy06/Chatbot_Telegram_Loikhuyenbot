@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -20,7 +21,7 @@ def _resolve_data_path(value: str | Path) -> Path:
     path = Path(value).expanduser()
     if not path.is_absolute():
         parts = list(path.parts)
-        if parts and parts[0].casefold() == PROJECT_ROOT.name.casefold():
+        if parts and parts[0].casefold() in {PROJECT_ROOT.name.casefold(), "dnse"}:
             parts = parts[1:]
         path = PROJECT_ROOT.joinpath(*parts)
     return path.resolve()
@@ -274,6 +275,18 @@ def _has_minimum_quarter_periods(path: Path, minimum: int) -> bool:
     return int(periods[periods.str.fullmatch(r"\d{4}-Q[1-4]", na=False)].nunique()) >= minimum
 
 
+def _needs_quarter_refresh(path: Path, minimum: int) -> bool:
+    """Cache đủ số kỳ vẫn cần làm mới khi cũ hoặc thiếu tỷ số định giá."""
+    if not _has_minimum_quarter_periods(path, minimum):
+        return True
+    if time.time() - path.stat().st_mtime >= 86400:
+        return True
+    from .fundamental_schema import normalize_fundamental_fields
+    frame = normalize_fundamental_fields(pd.read_csv(path))
+    latest = frame.sort_values("period").iloc[-1]
+    return bool(pd.isna(latest["pe"]) or pd.isna(latest["pb"]))
+
+
 def sync_symbol_fundamentals_hybrid(
         symbol: str,
         output_dir: Path,
@@ -295,6 +308,8 @@ def sync_symbol_fundamentals_hybrid(
     period_limit_quarter = max(5, period_limit_quarter)
     year_file = output_dir / "fundamental" / "year" / f"{sym}_fundamentals.csv"
     quarter_file = output_dir / "fundamental" / "quarter" / f"{sym}_fundamentals.csv"
+    from .industry_reference import refresh_industries
+    refresh_industries(output_dir, use_system_proxy=use_system_proxy)
 
     # LƯỢT 1: Nạp lịch sử theo năm (3 năm gần nhất)
     if not year_file.is_file():
@@ -326,7 +341,7 @@ def sync_symbol_fundamentals_hybrid(
                 LOGGER.error("Lỗi khi fallback vnstock cào year cho %s: %s", sym, exc)
 
     # LƯỢT 2: Bù đắp ít nhất 5 quý để ROE TTM có vốn chủ đầu kỳ và cuối kỳ.
-    if not _has_minimum_quarter_periods(quarter_file, period_limit_quarter):
+    if _needs_quarter_refresh(quarter_file, period_limit_quarter):
         try:
             from .dnse_api_crawl import crawl_fundamentals
         except ImportError:

@@ -937,6 +937,13 @@ def _canonical_financial_row(
     """Them schema tai chinh toi thieu va uoc luong ngay cong bo khi can."""
 
     output = dict(row)
+    try:
+        from .fundamental_schema import FUNDAMENTAL_ALIASES
+    except ImportError:
+        from fundamental_schema import FUNDAMENTAL_ALIASES
+    for target, aliases in FUNDAMENTAL_ALIASES.items():
+        output[target] = next((number for name in (target, *aliases)
+                               if (number := _to_float(row.get(name))) is not None), None)
     source = str(row.get("source", "")).upper()
 
     def normalize_percent(*names: str) -> Any:
@@ -1055,8 +1062,8 @@ def _screening_row(row: dict[str, Any]) -> dict[str, Any]:
         "eps": normalize_eps(eps),
         "eps_diluted": first_value("eps_diluted_vnd", "diluted_earnings_per_share"),
         "eps_ttm": row.get("trailing_eps"),
-        "pe": row.get("pe_ratio"),
-        "pb": row.get("pb_ratio"),
+        "pe": first_value("pe", "pe_ratio"),
+        "pb": first_value("pb", "pb_ratio"),
         "ps": row.get("ps_ratio"),
         "roe": row.get("roe"),
         "roa": row.get("roa"),
@@ -1316,6 +1323,11 @@ def crawl_fundamentals(
         use_system_proxy: bool,
 ) -> None:
     """Crawl fundamental va tao bang screening moi nhat theo quy/nam."""
+    try:
+        from .industry_reference import refresh_industries
+    except ImportError:
+        from industry_reference import refresh_industries
+    refresh_industries(output_dir, use_system_proxy=use_system_proxy)
     fundamental_client = FundamentalClient(
         source=source,
         period_limit=period_limit,
@@ -1395,7 +1407,15 @@ def crawl_fundamentals(
 
     for period, rows in screening_rows.items():
         if rows:
-            save_rows(rows, output_dir / "fundamental" / f"screening_{period}.csv")
+            path = output_dir / "fundamental" / f"screening_{period}.csv"
+            # Đồng bộ một mã không được xóa screening của các mã đã thu thập trước.
+            existing = []
+            if path.is_file():
+                with path.open(encoding="utf-8-sig", newline="") as handle:
+                    existing = list(csv.DictReader(handle))
+            updated = {row["symbol"]: row for row in existing}
+            updated.update({row["symbol"]: row for row in rows})
+            save_rows(list(updated.values()), path)
 
 
 def iter_realtime(

@@ -9,7 +9,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
-from .models import (
+from .models_signal import (
     ForeignFlowSession,
     MarketContext,
     PositionContext,
@@ -206,12 +206,14 @@ class SignalEngine:
             if value is not None and value != ""
         }
         metadata.update(event.metadata)
+        metadata.setdefault("investment_mode", str(snapshot.get("investment_mode") or "SHORT_TERM").strip().upper())
         stable_key = "|".join(
             (
                 event.strategy,
                 event.strategy_version,
                 event.symbol.upper(),
                 event.action,
+                metadata["investment_mode"],
                 event.data_as_of,
             )
         )

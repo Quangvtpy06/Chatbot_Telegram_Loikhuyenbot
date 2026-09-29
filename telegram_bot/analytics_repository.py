@@ -13,7 +13,7 @@ from typing import Any
 
 try:
     from signals.signal_engine import SignalEngine, create_signal_engine
-    from signals.models import SignalEvent
+    from signals.models_signal import SignalEvent
     from storage.repositories import PositionRepository
 except ImportError:  # Hỗ trợ chạy ``python -m dnse.telegram_bot`` từ thư mục cha.
     from dnse.signals.signal_engine import SignalEngine, create_signal_engine
@@ -263,10 +263,16 @@ class AnalyticsRepository:
                 "ob_support",
                 "ob_resistance",
                 "pe_quarter",
+                "pe_year",
                 "pb_quarter",
+                "pb_year",
                 "roe_quarter",
+                "roe_year",
+                "sector",
                 "roe_ttm",
                 "debt_to_equity",
+                "debt_to_equity_quarter",
+                "debt_to_equity_year",
                 "foreign_net_volume_5d",
                 "total_volume",
                 "latest_volume",
@@ -283,9 +289,8 @@ class AnalyticsRepository:
         # Cả hai cột đã có đơn vị cổ phiếu trong pipeline; không quy đổi lần nữa.
         raw_vol = values.get("latest_volume")
         tot_v = values.get("total_volume")
-        if tot_v is not None and tot_v > 0:
-            if raw_vol is None or tot_v >= raw_vol:
-                raw_vol = float(tot_v)
+        if tot_v is not None:
+            raw_vol = float(tot_v)
         metrics["volume"] = raw_vol
 
         display_price = event.reference_price or values.get("realtime_price") or values.get("latest_close")

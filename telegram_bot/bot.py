@@ -154,7 +154,7 @@ def create_application(config: BotConfig) -> Application:
     # proxy không hoạt động là nguyên nhân phổ biến khiến Telegram không kết nối.
     trust_environment = config.use_system_proxy and config.proxy_url is None
     api_request = HTTPXRequest(
-        connect_timeout=10,
+        connect_timeout=30,
         read_timeout=20,
         write_timeout=10,
         proxy=config.proxy_url,
@@ -162,7 +162,7 @@ def create_application(config: BotConfig) -> Application:
     )
     polling_request = HTTPXRequest(
         connection_pool_size=1,
-        connect_timeout=10,
+        connect_timeout=30,
         read_timeout=30,
         write_timeout=10,
         proxy=config.proxy_url,
@@ -243,12 +243,14 @@ def main() -> None:
             url_path=config.webhook_path,
             webhook_url=config.webhook_url,
             secret_token=config.webhook_secret_token,
+            bootstrap_retries=3,
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
         )
     else:
         application.run_polling(
             poll_interval=config.poll_interval,
+            bootstrap_retries=3,
             timeout=20,
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,

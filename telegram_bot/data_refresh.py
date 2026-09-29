@@ -14,19 +14,23 @@ from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 try:
+    from collectors_processing.symbol_registry import equity_symbols
     from collectors_processing.analytics import AnalyticsPipeline, PipelineConfig
     from collectors_processing.dnse_api_crawl import (
         DNSEClient,
         DNSEConfig,
         crawl_fundamentals,
+        save_rows,
         save_latest_realtime_rows,
     )
 except ImportError:
+    from dnse.collectors_processing.symbol_registry import equity_symbols
     from dnse.collectors_processing.analytics import AnalyticsPipeline, PipelineConfig
     from dnse.collectors_processing.dnse_api_crawl import (
         DNSEClient,
         DNSEConfig,
         crawl_fundamentals,
+        save_rows,
         save_latest_realtime_rows,
     )
 
@@ -55,6 +59,7 @@ class RealtimeRefreshService:
         self._task: asyncio.Task[None] | None = None
         self._last_realtime_at = 0.0
         self._last_analytics_at = 0.0
+        self._history_refresh_dates: dict[str, str] = {}
         self._fundamental_state_path = (
                 self.config.data_dir / "fundamental" / "auto_refresh_state.json"
         )
@@ -88,11 +93,12 @@ class RealtimeRefreshService:
 
         while True:
             try:
-                symbols = self._symbols()
+                symbols = await asyncio.to_thread(self._symbols)
                 if symbols:
                     wall_now = datetime.now(timezone.utc)
                     monotonic_now = time.monotonic()
                     market_open = self._is_market_open(wall_now)
+                    refreshed = False
                     if (
                             market_open
                             and (
@@ -103,6 +109,7 @@ class RealtimeRefreshService:
                     ):
                         await asyncio.to_thread(self._refresh_realtime, symbols)
                         self._last_realtime_at = time.monotonic()
+                        refreshed = True
                     if (
                             self._fundamental_due(wall_now)
                             and not market_open
@@ -114,7 +121,7 @@ class RealtimeRefreshService:
                         )
 
                     if (
-                            self._last_analytics_at == 0
+                            refreshed or self._last_analytics_at == 0
                             or monotonic_now - self._last_analytics_at
                             >= self.config.analytics_refresh_seconds
                     ):
@@ -139,8 +146,23 @@ class RealtimeRefreshService:
     def _refresh_realtime(self, symbols: tuple[str, ...]) -> None:
         """Lấy một snapshot realtime cho toàn bộ mã đang theo dõi."""
 
+        valid = equity_symbols()
+        symbols = tuple(symbol for symbol in symbols if symbol in valid)
+        if not symbols:
+            return
         client = DNSEClient(DNSEConfig())
         try:
+            # Bù các phiên còn thiếu trước khi ghép nến realtime để chỉ báo không nhảy ngày.
+            now = datetime.now(VIETNAM_TIMEZONE)
+            today = now.strftime("%Y-%m-%d")
+            for symbol in symbols:
+                if self._history_refresh_dates.get(symbol) != today:
+                    history = client.fetch_history(
+                        symbol, (now - timedelta(days=365)).strftime("%Y-%m-%d"), today, "1D"
+                    )
+                    if history:
+                        save_rows(history, self.config.data_dir / "history" / f"{symbol}_1D.csv")
+                        self._history_refresh_dates[symbol] = today
             rows = client.fetch_realtime(symbols)
             if rows:
                 save_latest_realtime_rows(
@@ -230,7 +252,7 @@ class RealtimeRefreshService:
         if not configured:
             configured.update(self._snapshot_symbols())
             configured.difference_update(INVALID_EQUITY_SYMBOLS)
-        symbols = tuple(sorted(configured))
+        symbols = tuple(sorted(configured.intersection(equity_symbols())))
         if len(symbols) > self.config.realtime_max_symbols:
             return symbols[: self.config.realtime_max_symbols]
         return symbols
@@ -261,6 +283,7 @@ class RealtimeRefreshService:
                 output_dir=self.config.analytics_output_dir,
                 database_path=self.config.analytics_database,
                 expected_symbols=symbols,
+                allowed_symbols=equity_symbols(),
             )
         )
         report = pipeline.run()

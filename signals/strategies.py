@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, Protocol
 
-from .models import ForeignFlowSummary, SignalEvent, SignalRequest
+from .models_signal import ForeignFlowSummary, SignalEvent, SignalRequest
 
 
 def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
@@ -135,6 +135,8 @@ class QualityTrendStrategy:
         "ngan hang",
         "chung khoan",
         "tai chinh",
+        "bao hiem",
+        "insurance",
     }
 
     def __init__(self, config: QualityTrendConfig | None = None) -> None:
@@ -206,6 +208,11 @@ class QualityTrendStrategy:
         close = _number(snapshot, "realtime_price", "latest_close") or reference_price
         sma_20 = _number(snapshot, "sma_20")
         sma_50 = _number(snapshot, "sma_50")
+        if str(snapshot.get("investment_mode") or "SHORT_TERM").strip().upper() == "LONG_TERM":
+            return self._evaluate_long_term(
+                request=request, symbol=symbol, sector=sector,
+                data_status=data_status, data_as_of=data_as_of, close=close,
+            )
         assert close is not None and sma_20 is not None and sma_50 is not None
         return self._evaluate_entry(
             request=request,
@@ -236,9 +243,9 @@ class QualityTrendStrategy:
 
         required_price_fields = {
             "latest_close": _number(snapshot, "latest_close", "realtime_price"),
-            "sma_20": _number(snapshot, "sma_20"),
-            "sma_50": _number(snapshot, "sma_50"),
         }
+        if str(snapshot.get("investment_mode") or "SHORT_TERM").strip().upper() != "LONG_TERM":
+            required_price_fields.update(sma_20=_number(snapshot, "sma_20"), sma_50=_number(snapshot, "sma_50"))
         missing = [name for name, value in required_price_fields.items() if value is None]
         if missing:
             reasons.append(f"Thiếu dữ liệu giá bắt buộc: {', '.join(missing)}")
@@ -301,6 +308,69 @@ class QualityTrendStrategy:
             if not (m_c > m_s20):
                 return [f"Thị trường chung (VNINDEX) chưa thuận lợi: Giá {m_c:.2f} <= SMA20 {m_s20:.2f}"]
         return []
+
+    def _evaluate_long_term(
+        self, *, request: SignalRequest, symbol: str, sector: str | None,
+        data_status: str, data_as_of: str, close: float,
+    ) -> SignalEvent:
+        """Đánh giá cơ bản độc lập; không chuyển sang mua kỹ thuật khi không đạt."""
+        snapshot = request.snapshot
+        roe = _number(snapshot, "roe_ttm", "roe_quarter", "roe_year")
+        pe = _number(snapshot, "pe_quarter", "pe_year", "pe")
+        pb = _number(snapshot, "pb_quarter", "pb_year", "pb")
+        debt = _number(snapshot, "debt_to_equity_quarter", "debt_to_equity_year", "debt_to_equity")
+        financial = self._is_financial_sector(sector)
+        metadata = {"investment_mode": "LONG_TERM", "roe_ttm": roe, "pe": pe, "pb": pb}
+        common = dict(symbol=symbol, reference_price=close, data_as_of=data_as_of,
+                      sector=sector, metadata=metadata)
+        sell = []
+        if pe is not None and pe >= 28:
+            sell.append(f"Định giá cao: P/E = {pe:.1f} >= 28.")
+        if roe is not None and roe < 0:
+            sell.append(f"Hiệu quả kinh doanh suy giảm: ROE = {roe*100:.1f}% < 0%.")
+        if sector and not financial and debt is not None and debt > 2.5:
+            sell.append(f"Đòn bẩy cao: D/E = {debt:.2f} > 2.5.")
+        if sell:
+            metadata["sell_trigger"] = "FUNDAMENTAL_SELL"
+            return self._event(**common, action="SELL", confidence=None,
+                               stop_loss=None, take_profit=None, data_status=data_status,
+                               signal_status="ELIGIBLE", reasons=["🏛 [DÀI HẠN] Cảnh báo cơ bản:", *sell])
+        missing = []
+        if not sector:
+            missing.append("phân ngành để áp dụng đúng ngưỡng D/E")
+        if roe is None:
+            missing.append("ROE")
+        if pe is None or pe <= 0:
+            missing.append("P/E dương")
+        if pb is None or pb <= 0:
+            missing.append("P/B dương")
+        if not financial and (debt is None or debt < 0):
+            missing.append("D/E hợp lệ")
+        if missing:
+            metadata["missing_fundamental_fields"] = missing
+            return self._event(**common, action="NO SIGNAL", confidence=None,
+                               stop_loss=None, take_profit=None, data_status="DATA WARNING",
+                               signal_status="NO SIGNAL",
+                               reasons=["🏛 [DÀI HẠN] Chưa đủ dữ liệu cơ bản: " + ", ".join(missing)])
+        failed = []
+        if roe < self.config.roe_ttm_min:
+            failed.append(f"ROE = {roe*100:.1f}% dưới ngưỡng {self.config.roe_ttm_min*100:.1f}%.")
+        if pe > 16:
+            failed.append(f"P/E = {pe:.1f} > 16.")
+        if pb > 2.2:
+            failed.append(f"P/B = {pb:.1f} > 2.2.")
+        if not financial and debt > 1.8:
+            failed.append(f"D/E = {debt:.2f} > 1.8.")
+        if failed:
+            return self._event(**common, action="HOLD", confidence=None,
+                               stop_loss=None, take_profit=None, data_status=data_status,
+                               signal_status="ELIGIBLE",
+                               reasons=["🏛 [DÀI HẠN] Chưa đạt điều kiện mua tích sản:", *failed])
+        return self._event(**common, action="BUY", confidence=85.0,
+                           stop_loss=round(close * .85, 6), take_profit=round(close * 1.35, 6),
+                           data_status=data_status, signal_status="ELIGIBLE",
+                           reasons=["🏛 [DÀI HẠN] Đạt điều kiện cơ bản để tích sản:",
+                                    f"ROE = {roe*100:.1f}%; P/E = {pe:.1f}; P/B = {pb:.1f}."])
 
     def _evaluate_entry(
         self,
@@ -368,54 +438,7 @@ class QualityTrendStrategy:
         user_sl_pct = _number(snapshot, "fixed_sl_pct") or self.config.stop_loss_pct
         user_tp_pct = _number(snapshot, "fixed_tp_pct") or self.config.take_profit_pct
 
-        # Phân nhánh BUY cho DÀI HẠN (Cơ bản / Tích sản)
-        if investment_mode == "LONG_TERM":
-            lt_failed = []
-            if roe_ttm is not None and roe_ttm < self.config.roe_ttm_min:
-                lt_failed.append(f"Cơ bản yếu: ROE TTM = {roe_ttm*100:.1f}% dưới mức tối thiểu {self.config.roe_ttm_min*100:.1f}%")
-            if not is_financial and debt_to_equity is not None and debt_to_equity > 1.8:
-                lt_failed.append(f"Đòn bẩy cao: D/E = {debt_to_equity:.2f} vượt ngưỡng an toàn dài hạn (1.8)")
-            if pe_val is not None and pe_val > 16.0:
-                lt_failed.append(f"Định giá chưa đủ hấp dẫn để tích sản dài hạn: P/E = {pe_val:.1f} > 16.0")
-            if pb_val is not None and pb_val > 2.2:
-                lt_failed.append(f"Định giá P/B = {pb_val:.1f} > 2.2")
-            if rsi_14 is not None and rsi_14 < 30 and foreign.net_volume < 0 and foreign.net_sell_sessions >= 4:
-                lt_failed.append(f"Cổ phiếu đang bị bán tháo rủi ro cao (RSI={rsi_14:.1f} kèm khối ngoại xả mạnh)")
-
-            if not lt_failed:
-                lt_reasons = [
-                    f"🏛 [DÀI HẠN] Đạt tiêu chuẩn đầu tư giá trị & tích sản:",
-                    f"• Doanh nghiệp hiệu quả cao: ROE TTM = {(roe_ttm or 0.15)*100:.1f}%",
-                ]
-                if pe_val:
-                    lt_reasons.append(f"• Định giá hấp dẫn: P/E = {pe_val:.1f}")
-                if pb_val:
-                    lt_reasons.append(f"• Định giá P/B = {pb_val:.1f}")
-                lt_reasons.append("• Khuyến nghị TÍCH SẢN DÀI HẠN với biên an toàn lớn, bỏ qua rung lắc nến ngày.")
-
-                return self._event(
-                    symbol=symbol,
-                    action="BUY",
-                    confidence=85.0,
-                    reference_price=close,
-                    stop_loss=round(close * 0.85, 6),
-                    take_profit=round(close * 1.35, 6),
-                    reasons=lt_reasons,
-                    data_as_of=data_as_of,
-                    data_status=data_status,
-                    signal_status="ELIGIBLE",
-                    sector=sector,
-                    metadata={
-                        "investment_mode": "LONG_TERM",
-                        "foreign_net_volume_5d": foreign.net_volume,
-                        "foreign_net_buy_sessions_5d": foreign.net_buy_sessions,
-                        "pe": pe_val,
-                        "pb": pb_val,
-                        "roe_ttm": roe_ttm,
-                    },
-                )
-
-        # Phân nhánh BUY cho NGẮN HẠN (Kỹ thuật / Momentum) hoặc CẢ HAI
+        # Đánh giá BUY kỹ thuật; dài hạn đã trả kết quả ở nhánh riêng.
         failed = []
         is_short_term = (investment_mode == "SHORT_TERM")
         max_de = _number(snapshot, "debt_to_equity_max", "de_max") or self.config.debt_to_equity_max
@@ -643,65 +666,54 @@ class QualityTrendStrategy:
         # ── 3. KIỂM TRA ĐIỀU KIỆN BÁN (SELL) ──────────────────────────
         sell_reasons = []
 
-        if investment_mode == "LONG_TERM":
-            # Tiêu chuẩn BÁN cho Dài hạn: sự kiện trọng yếu, định giá bong bóng hoặc cơ bản suy thoái
-            if pe_val is not None and pe_val >= 28.0:
-                sell_reasons.append(f"🏛 [DÀI HẠN] Định giá P/E = {pe_val:.1f} quá đắt (vùng bong bóng / khuyến nghị chốt lời dài hạn)")
-            if not is_financial and debt_to_equity is not None and debt_to_equity > 2.5:
-                sell_reasons.append(f"🏛 [DÀI HẠN] Đòn bẩy tài chính tăng vọt nguy hiểm (D/E = {debt_to_equity:.2f} > 2.5)")
-            if roe_ttm is not None and roe_ttm < 0:
-                sell_reasons.append(f"🏛 [DÀI HẠN] Doanh nghiệp kinh doanh thua lỗ (ROE TTM = {roe_ttm*100:.1f}% < 0)")
-            if foreign.session_count >= 5 and foreign.net_volume < 0 and foreign.net_sell_sessions >= 5 and sma_20 is not None and close < sma_20:
-                sell_reasons.append(f"🏛 [DÀI HẠN] Khối ngoại xả tháo chạy 5/5 phiên liên tiếp khi giá thủng mốc xu hướng trung hạn")
-        else:
-            # Tiêu chuẩn BÁN Ngắn hạn / Kỹ thuật có bộ lọc hội tụ (Confluence Filters)
-            # Kịch bản 1: Gãy xu hướng trung hạn
-            if sma_20 is not None and sma_50 is not None and close < sma_20 and sma_20 < sma_50:
+        # Tiêu chuẩn BÁN Ngắn hạn / Kỹ thuật có bộ lọc hội tụ (Confluence Filters)
+        # Kịch bản 1: Gãy xu hướng trung hạn
+        if sma_20 is not None and sma_50 is not None and close < sma_20 and sma_20 < sma_50:
+            if macd < macd_signal:
+                sell_reasons.append(f"Gãy xu hướng: Giá ({close:,.0f}) < SMA20 ({sma_20:,.0f}) < SMA50 ({sma_50:,.0f}) kèm MACD dốc xuống")
+
+        # Kịch bản 2: Gãy dải dưới Bollinger Bands CÓ XÁC NHẬN
+        bb_broken = bollinger_lower is not None and close < bollinger_lower
+        foreign_dump = (
+            foreign.session_count >= 5
+            and foreign.net_volume < 0
+            and foreign.net_sell_sessions >= 4
+            and sma_20 is not None
+            and close < sma_20
+        )
+        bb_expanding = bollinger_bandwidth is None or bollinger_bandwidth >= 0.08
+        ob_broken = ob_support is not None and close < ob_support
+
+        if bb_broken:
+            if foreign_dump:
+                sell_reasons.append(
+                    f"Gãy dải dưới Bollinger ({bollinger_lower:,.0f}) kèm áp lực bán ròng khối ngoại ({foreign.net_sell_sessions}/5 phiên) khi giá dưới SMA20"
+                )
+            elif bb_expanding and rsi_14 < 45 and macd < macd_signal:
+                bw_str = f"{bollinger_bandwidth*100:.1f}%" if bollinger_bandwidth is not None else "đang mở"
+                sell_reasons.append(
+                    f"Gãy dải dưới Bollinger ({bollinger_lower:,.0f}) trong pha mở rộng dải ({bw_str}) kèm RSI={rsi_14:.1f} và MACD suy yếu"
+                )
+            elif ob_broken:
+                sell_reasons.append(
+                    f"Gãy đồng thời dải dưới Bollinger ({bollinger_lower:,.0f}) và thủng đáy hỗ trợ Order Block ({ob_support:,.0f})"
+                )
+
+        # Kịch bản 3: Thủng hỗ trợ cấu trúc Order Block độc lập
+        if ob_broken and not bb_broken:
+            if close < (sma_20 or close * 1.01) or macd < macd_signal:
+                sell_reasons.append(f"Thủng đáy vùng hỗ trợ Bullish Order Block ({ob_support:,.0f})")
+
+        # Kịch bản 4: Đảo chiều tại vùng cản kháng cự quá mua
+        if rsi_14 > 70 or (stochastic_k is not None and stochastic_k > 80):
+            res_target = ob_resistance or bollinger_upper
+            if res_target is not None and close >= res_target * 0.98:
                 if macd < macd_signal:
-                    sell_reasons.append(f"Gãy xu hướng: Giá ({close:,.0f}) < SMA20 ({sma_20:,.0f}) < SMA50 ({sma_50:,.0f}) kèm MACD dốc xuống")
+                    sell_reasons.append(f"Chạm vùng cản kháng cự ({res_target:,.0f}) trong trạng thái quá mua (RSI={rsi_14:.1f}) và MACD đảo chiều giảm")
 
-            # Kịch bản 2: Gãy dải dưới Bollinger Bands CÓ XÁC NHẬN
-            bb_broken = bollinger_lower is not None and close < bollinger_lower
-            foreign_dump = (
-                foreign.session_count >= 5
-                and foreign.net_volume < 0
-                and foreign.net_sell_sessions >= 4
-                and sma_20 is not None
-                and close < sma_20
-            )
-            bb_expanding = bollinger_bandwidth is None or bollinger_bandwidth >= 0.08
-            ob_broken = ob_support is not None and close < ob_support
-
-            if bb_broken:
-                if foreign_dump:
-                    sell_reasons.append(
-                        f"Gãy dải dưới Bollinger ({bollinger_lower:,.0f}) kèm áp lực bán ròng khối ngoại ({foreign.net_sell_sessions}/5 phiên) khi giá dưới SMA20"
-                    )
-                elif bb_expanding and rsi_14 < 45 and macd < macd_signal:
-                    bw_str = f"{bollinger_bandwidth*100:.1f}%" if bollinger_bandwidth is not None else "đang mở"
-                    sell_reasons.append(
-                        f"Gãy dải dưới Bollinger ({bollinger_lower:,.0f}) trong pha mở rộng dải ({bw_str}) kèm RSI={rsi_14:.1f} và MACD suy yếu"
-                    )
-                elif ob_broken:
-                    sell_reasons.append(
-                        f"Gãy đồng thời dải dưới Bollinger ({bollinger_lower:,.0f}) và thủng đáy hỗ trợ Order Block ({ob_support:,.0f})"
-                    )
-
-            # Kịch bản 3: Thủng hỗ trợ cấu trúc Order Block độc lập
-            if ob_broken and not bb_broken:
-                if close < (sma_20 or close * 1.01) or macd < macd_signal:
-                    sell_reasons.append(f"Thủng đáy vùng hỗ trợ Bullish Order Block ({ob_support:,.0f})")
-
-            # Kịch bản 4: Đảo chiều tại vùng cản kháng cự quá mua
-            if rsi_14 > 70 or (stochastic_k is not None and stochastic_k > 80):
-                res_target = ob_resistance or bollinger_upper
-                if res_target is not None and close >= res_target * 0.98:
-                    if macd < macd_signal:
-                        sell_reasons.append(f"Chạm vùng cản kháng cự ({res_target:,.0f}) trong trạng thái quá mua (RSI={rsi_14:.1f}) và MACD đảo chiều giảm")
-
-            # Kịch bản 5: Khối ngoại phân phối áp đảo độc lập
-            if foreign_dump and not bb_broken:
-                sell_reasons.append(f"Áp lực bán ròng khối ngoại áp đảo ({foreign.net_sell_sessions}/5 phiên) khi giá nằm dưới SMA20")
+        # Kịch bản 5: Khối ngoại phân phối áp đảo độc lập
+        if foreign_dump and not bb_broken:
+            sell_reasons.append(f"Áp lực bán ròng khối ngoại áp đảo ({foreign.net_sell_sessions}/5 phiên) khi giá nằm dưới SMA20")
 
         if sell_reasons:
             return self._event(
@@ -709,8 +721,8 @@ class QualityTrendStrategy:
                 action="SELL",
                 confidence=None,
                 reference_price=close,
-                stop_loss=round(close * 1.05, 6) if investment_mode != "LONG_TERM" else round(close * 1.15, 6),
-                take_profit=round(close * 0.90, 6) if investment_mode != "LONG_TERM" else round(close * 0.80, 6),
+                stop_loss=round(close * 1.05, 6),
+                take_profit=round(close * 0.90, 6),
                 reasons=sell_reasons,
                 data_as_of=data_as_of,
                 data_status=data_status,
@@ -720,7 +732,7 @@ class QualityTrendStrategy:
                     "investment_mode": investment_mode,
                     "foreign_net_volume_5d": foreign.net_volume,
                     "foreign_net_buy_sessions_5d": foreign.net_buy_sessions,
-                    "sell_trigger": "TECHNICAL_SELL" if investment_mode != "LONG_TERM" else "FUNDAMENTAL_SELL",
+                    "sell_trigger": "TECHNICAL_SELL",
                     "ob_support": ob_support,
                     "ob_resistance": ob_resistance,
                 },
@@ -728,49 +740,39 @@ class QualityTrendStrategy:
 
         # ── 4. NẾU KHÔNG PHẢI BUY VÀ SELL -> TÍN HIỆU LÀ HOLD (QUAN SÁT THÊM) ─
         hold_reasons = []
-        if investment_mode == "LONG_TERM":
-            hold_reasons.append("🏛 [DÀI HẠN] Định giá doanh nghiệp đang ở mức hợp lý.")
-            if pe_val:
-                pb_str = f"{pb_val:.1f}" if pb_val else "—"
-                hold_reasons.append(f"• Định giá: P/E = {pe_val:.1f} | P/B = {pb_str}")
-            if roe_ttm:
-                hold_reasons.append(f"• Hiệu quả hoạt động: ROE TTM = {roe_ttm*100:.1f}%")
-            hold_reasons.append("Chưa xuất hiện sự kiện trọng yếu hoặc định giá chiết khấu đủ sâu để tích sản thêm.")
-            hold_reasons.append("Khuyến nghị: DUY TRÌ VỊ THẾ / QUAN SÁT THÊM kết quả kinh doanh quý tới.")
-        else:
-            # 1. Đánh giá Chiến lược Xu hướng & MA
-            ma_trend = (
-                f"Giá ({close:,.0f}) trên SMA20 ({sma_20:,.0f}) & SMA50 ({sma_50:,.0f}) — Cấu trúc tăng ngắn hạn giữ vững"
-                if sma_20 and sma_50 and close > sma_20 and sma_20 > sma_50
-                else f"Giá ({close:,.0f}) nằm dưới SMA20 ({sma_20:,.0f}) — Đang trong nhịp điều chỉnh ngắn hạn"
-                if sma_20 and close < sma_20
-                else f"Giá ({close:,.0f}) bám sát hỗ trợ SMA20 ({sma_20:,.0f})"
-                if sma_20
-                else "Đang tích lũy quanh vùng hỗ trợ"
-            )
-            hold_reasons.append(f"Chiến lược Xu hướng & MA: {ma_trend}.")
+        # 1. Đánh giá Chiến lược Xu hướng & MA
+        ma_trend = (
+            f"Giá ({close:,.0f}) trên SMA20 ({sma_20:,.0f}) & SMA50 ({sma_50:,.0f}) — Cấu trúc tăng ngắn hạn giữ vững"
+            if sma_20 and sma_50 and close > sma_20 and sma_20 > sma_50
+            else f"Giá ({close:,.0f}) nằm dưới SMA20 ({sma_20:,.0f}) — Đang trong nhịp điều chỉnh ngắn hạn"
+            if sma_20 and close < sma_20
+            else f"Giá ({close:,.0f}) bám sát hỗ trợ SMA20 ({sma_20:,.0f})"
+            if sma_20
+            else "Đang tích lũy quanh vùng hỗ trợ"
+        )
+        hold_reasons.append(f"Chiến lược Xu hướng & MA: {ma_trend}.")
 
-            # 2. Đánh giá Chiến lược Động lượng (RSI & MACD)
-            rsi_desc = "Quá mua (>70)" if rsi_14 >= 70 else "Quá bán (<30)" if rsi_14 <= 30 else "Vùng tích lũy trung tính"
-            macd_desc = "trên Signal (Động lượng tích cực)" if macd > macd_signal else "dưới Signal (Chờ điểm giao cắt bứt phá)"
+        # 2. Đánh giá Chiến lược Động lượng (RSI & MACD)
+        rsi_desc = "Quá mua (>70)" if rsi_14 >= 70 else "Quá bán (<30)" if rsi_14 <= 30 else "Vùng tích lũy trung tính"
+        macd_desc = "trên Signal (Động lượng tích cực)" if macd > macd_signal else "dưới Signal (Chờ điểm giao cắt bứt phá)"
+        hold_reasons.append(
+            f"Chiến lược Động lượng: RSI(14) = {rsi_14:.1f} ({rsi_desc}) | MACD ({macd:.2f}) {macd_desc}."
+        )
+
+        # 3. Đánh giá Chiến lược Dòng tiền Khối ngoại
+        if foreign.session_count > 0:
+            f_action = "Mua ròng" if foreign.net_volume > 0 else "Bán ròng" if foreign.net_volume < 0 else "Cân bằng"
+            f_eval = "dòng tiền ngoại gom mua hỗ trợ lực cầu" if foreign.net_volume > 0 else "khối ngoại đang bán ròng nhẹ/điều chỉnh" if foreign.net_volume < 0 else "giao dịch cân bằng"
             hold_reasons.append(
-                f"Chiến lược Động lượng: RSI(14) = {rsi_14:.1f} ({rsi_desc}) | MACD ({macd:.2f}) {macd_desc}."
+                f"Chiến lược Dòng tiền Khối ngoại: {f_action} {foreign.net_volume:+,.0f} cp ({foreign.net_buy_sessions}/{foreign.session_count} phiên mua) — {f_eval}."
             )
 
-            # 3. Đánh giá Chiến lược Dòng tiền Khối ngoại
-            if foreign.session_count > 0:
-                f_action = "Mua ròng" if foreign.net_volume > 0 else "Bán ròng" if foreign.net_volume < 0 else "Cân bằng"
-                f_eval = "dòng tiền ngoại gom mua hỗ trợ lực cầu" if foreign.net_volume > 0 else "khối ngoại đang bán ròng nhẹ/điều chỉnh" if foreign.net_volume < 0 else "giao dịch cân bằng"
-                hold_reasons.append(
-                    f"Chiến lược Dòng tiền Khối ngoại: {f_action} {foreign.net_volume:+,.0f} cp ({foreign.net_buy_sessions}/{foreign.session_count} phiên mua) — {f_eval}."
-                )
+        # 4. Điểm nghẽn cần theo dõi thêm trước khi mở vị thế MUA (từ mảng failed)
+        if failed:
+            key_obstacles = [f.split(":")[-1].strip() for f in failed[:2]]
+            hold_reasons.append(f"Điểm nghẽn cần theo dõi: {'; '.join(key_obstacles)}.")
 
-            # 4. Điểm nghẽn cần theo dõi thêm trước khi mở vị thế MUA (từ mảng failed)
-            if failed:
-                key_obstacles = [f.split(":")[-1].strip() for f in failed[:2]]
-                hold_reasons.append(f"Điểm nghẽn cần theo dõi: {'; '.join(key_obstacles)}.")
-
-            hold_reasons.append("Khuyến nghị: QUAN SÁT THÊM — Kiên nhẫn chờ điểm bứt phá xác nhận dòng tiền.")
+        hold_reasons.append("Khuyến nghị: QUAN SÁT THÊM — Kiên nhẫn chờ điểm bứt phá xác nhận dòng tiền.")
 
         # Ghi chú nhận định chuyên sâu về Bollinger Bands & Quá bán (tránh false breakdown)
         if bollinger_lower is not None and close <= bollinger_lower:

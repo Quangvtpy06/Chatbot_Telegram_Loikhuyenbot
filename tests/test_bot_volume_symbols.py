@@ -19,6 +19,14 @@ from telegram_bot.models import SignalView
 from telegram_bot.subscriber_repository import SubscriberRepository
 
 
+@pytest.fixture(autouse=True)
+def danh_muc_dnse_gia_lap(monkeypatch):
+    """Kiểm thử độc lập mạng và thông tin xác thực thật."""
+    valid = lambda: frozenset({"FPT", "HAG", "HPG"})
+    monkeypatch.setattr("telegram_bot.handlers.equity_symbols", valid)
+    monkeypatch.setattr("telegram_bot.data_refresh.equity_symbols", valid)
+
+
 @pytest.fixture
 def tmp_path():
     """Tạo thư mục kiểm thử trong workspace, giữ quyền kế thừa trên Windows."""
@@ -75,6 +83,56 @@ def test_khoi_luong_chi_quy_doi_mot_lan(tmp_path, symbol, raw_volume, shares):
 def test_hien_thi_du_phong_giu_nguyen_don_vi_cp(metrics, volume, expected):
     view = SignalView("HAG", "NO SIGNAL", "OK", "NO SIGNAL", metrics=metrics)
     assert expected in format_check(view, volume=volume)
+
+
+@pytest.mark.parametrize("realtime,expected", [(1200, 1200), (0, 0), (None, 900000)])
+def test_uu_tien_khoi_luong_trong_phien(tmp_path, realtime, expected):
+    """Khối lượng đầu phiên không được thay bằng số lớn hơn của phiên trước."""
+    database = tmp_path / "volume.sqlite"
+    with closing(sqlite3.connect(database)) as connection:
+        pd.DataFrame([{
+            "symbol": "FPT", "total_volume": realtime,
+            "latest_volume": 900000, "latest_close": 90.0,
+            "realtime_price": 91.0, "price_as_of": "2026-09-29",
+        }]).to_sql("stock_snapshot", connection, index=False)
+    view, _ = AnalyticsRepository(database, tmp_path / "quality.json").get_signal_view("FPT")
+    assert view.metrics["volume"] == expected
+    assert f"{expected:,.0f} cp" in format_check(view)
+
+
+def test_market_hien_thi_tong_gia_tri_va_thoi_gian():
+    """Giữ đơn vị cp, tỷ đồng và thời điểm của snapshot chỉ số."""
+    from telegram_bot.formatter import format_market
+    text = format_market({
+        "c": 1777.73, "prev_c": 1780.68, "v": 530476411,
+        "value_billion": 12179.83027171, "as_of": "2026-09-29 14:45:05",
+    }, {})
+    assert "530,476,411 cp" in text
+    assert "12,179.83 tỷ đồng" in text
+    assert "2026-09-29 14:45:05" in text
+    assert "VN30:</b> Không có dữ liệu" in text
+
+
+def test_check_khong_tao_bieu_do(monkeypatch):
+    """Lệnh check chỉ gửi văn bản sau khi phân tích."""
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from telegram_bot import chart_service
+    handler = object.__new__(BotHandlers)
+    handler._authorize = AsyncMock(return_value=True)
+    handler._save_user = Mock()
+    handler._on_demand_fetch_and_analyze = AsyncMock(return_value=(
+        SignalView("FPT", "NO SIGNAL", "OK", "NO SIGNAL"), None,
+    ))
+    handler._reply = AsyncMock()
+    chart = Mock(side_effect=AssertionError("Không được vẽ trong /check"))
+    monkeypatch.setattr(chart_service, "generate_bollinger_chart", chart)
+    message = SimpleNamespace(reply_photo=AsyncMock())
+    asyncio.run(handler.check(SimpleNamespace(effective_message=message), SimpleNamespace(args=["FPT"])))
+    handler._reply.assert_awaited_once()
+    chart.assert_not_called()
+    message.reply_photo.assert_not_awaited()
 
 
 def test_vnpt_bi_loai_khoi_watchlist_va_khong_them_lai(tmp_path):

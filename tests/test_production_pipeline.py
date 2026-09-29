@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from notifications.service import OutboxNotificationService
-from signals.models import SignalEvent
+from signals.models_signal import SignalEvent
 from signals.risk_manager import RiskConfig, create_risk_gate
 from storage.migrations import LATEST_SCHEMA_VERSION, current_schema_version, migrate_database
 from storage.repositories import (
